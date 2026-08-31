@@ -12,7 +12,7 @@
 
 ### Changed
 
-- Changed `/thinking`, `/model`, and `/scoped-models` to keep active options marked while browsing. `/scoped-models` now uses consistent per-item toggles and strikes through unavailable models ([#8900](https://github.com/earendil-works/pi/pull/8900)).
+- Changed `/thinking`, `/model`, `/scoped-models`, and `/trust` to keep active options marked while browsing. `/scoped-models` now uses consistent per-item toggles and strikes through unavailable models ([#8900](https://github.com/earendil-works/pi/pull/8900)).
 
 ### Fixed
 
