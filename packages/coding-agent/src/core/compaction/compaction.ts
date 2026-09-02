@@ -9,6 +9,7 @@ import type { AgentMessage, StreamFn, ThinkingLevel } from "@earendil-works/pi-a
 import { contentText, type RetryCallbacks, type RetryPolicy, retryAssistantCall, uuidv7 } from "@earendil-works/pi-ai";
 import type { AssistantMessage, Context, Model, SimpleStreamOptions, Usage } from "@earendil-works/pi-ai/compat";
 import { completeSimple } from "@earendil-works/pi-ai/compat";
+import chalk from "chalk";
 import { convertToLlm } from "../messages.ts";
 import {
 	buildSessionContext,
@@ -147,6 +148,43 @@ export function calculateContextTokens(usage: Usage): number {
 	return usage.totalTokens || usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
 }
 
+const warnedContextWindows = new Set<number>();
+
+/**
+ * A provider-reported context-token figure can never legitimately exceed the model's own
+ * context window - the API would refuse a request that large outright. When it does, the
+ * report itself is the anomaly (observed in production as a `claude-code-cli` usage.totalTokens
+ * reading ~78% over the model's 1M window, in the same order of magnitude as an accumulating
+ * counter rather than a per-call figure) and must not be trusted as "current context size".
+ */
+function isImplausibleContextTokens(tokens: number, contextWindow: number): boolean {
+	return contextWindow > 0 && tokens > contextWindow;
+}
+
+/**
+ * Surface a rejected provider usage figure once per distinct context window per process,
+ * mirroring the one-shot pattern used for deprecation warnings (see utils/deprecation.ts).
+ * A still-affected provider stream tends to keep reporting anomalous readings on every
+ * subsequent turn (per the production incident this guards against), so deduping per-window
+ * rather than per-exact-value avoids re-warning every turn while still surfacing the anomaly.
+ */
+function warnImplausibleContextTokens(reportedTokens: number, contextWindow: number): void {
+	if (warnedContextWindows.has(contextWindow)) return;
+	warnedContextWindows.add(contextWindow);
+	console.warn(
+		chalk.yellow(
+			`Warning: provider-reported context usage (${reportedTokens.toLocaleString()} tokens) exceeds the ` +
+				`model's context window (${contextWindow.toLocaleString()} tokens) and was rejected as implausible; ` +
+				`using a message-size estimate instead.`,
+		),
+	);
+}
+
+/** Clear one-shot implausible-context-tokens warning state. Exported for tests. */
+export function clearContextTokensWarningsForTests(): void {
+	warnedContextWindows.clear();
+}
+
 /**
  * Get usage from an assistant message if available.
  * Skips aborted, error, and all-zero usage messages as they don't have valid usage data.
@@ -185,6 +223,8 @@ export interface ContextUsageEstimate {
 	usageTokens: number;
 	trailingTokens: number;
 	lastUsageIndex: number | null;
+	/** True when the reported usage exceeded the model's context window and was rejected as implausible. */
+	usageRejected?: boolean;
 }
 
 function getLastAssistantUsageInfo(messages: AgentMessage[]): { usage: Usage; index: number } | undefined {
@@ -198,8 +238,14 @@ function getLastAssistantUsageInfo(messages: AgentMessage[]): { usage: Usage; in
 /**
  * Estimate context tokens from messages, using the last assistant usage when available.
  * If there are messages after the last usage, estimate their tokens with estimateTokens.
+ *
+ * @param contextWindow When provided, a reported usage figure exceeding this window is
+ * rejected as a provider reporting anomaly rather than trusted as the real context size;
+ * the estimate falls back to a message-size sum over every message instead. Omit when the
+ * model's context window is not known to the caller (the reported figure is then trusted
+ * as before - callers that know the window should always pass it).
  */
-export function estimateContextTokens(messages: AgentMessage[]): ContextUsageEstimate {
+export function estimateContextTokens(messages: AgentMessage[], contextWindow?: number): ContextUsageEstimate {
 	const usageInfo = getLastAssistantUsageInfo(messages);
 
 	if (!usageInfo) {
@@ -215,15 +261,31 @@ export function estimateContextTokens(messages: AgentMessage[]): ContextUsageEst
 		};
 	}
 
-	const usageTokens = calculateContextTokens(usageInfo.usage);
+	const reportedUsageTokens = calculateContextTokens(usageInfo.usage);
+
+	if (contextWindow !== undefined && isImplausibleContextTokens(reportedUsageTokens, contextWindow)) {
+		warnImplausibleContextTokens(reportedUsageTokens, contextWindow);
+		let estimated = 0;
+		for (const message of messages) {
+			estimated += estimateTokens(message);
+		}
+		return {
+			tokens: estimated,
+			usageTokens: 0,
+			trailingTokens: estimated,
+			lastUsageIndex: usageInfo.index,
+			usageRejected: true,
+		};
+	}
+
 	let trailingTokens = 0;
 	for (let i = usageInfo.index + 1; i < messages.length; i++) {
 		trailingTokens += estimateTokens(messages[i]);
 	}
 
 	return {
-		tokens: usageTokens + trailingTokens,
-		usageTokens,
+		tokens: reportedUsageTokens + trailingTokens,
+		usageTokens: reportedUsageTokens,
 		trailingTokens,
 		lastUsageIndex: usageInfo.index,
 	};
@@ -750,6 +812,7 @@ export interface CompactionPreparation {
 export function prepareCompaction(
 	pathEntries: SessionEntry[],
 	settings: CompactionSettings,
+	contextWindow?: number,
 ): CompactionPreparation | undefined {
 	if (pathEntries.length > 0 && pathEntries[pathEntries.length - 1].type === "compaction") {
 		return undefined;
@@ -773,7 +836,7 @@ export function prepareCompaction(
 	}
 	const boundaryEnd = pathEntries.length;
 
-	const tokensBefore = estimateContextTokens(buildSessionContext(pathEntries).messages).tokens;
+	const tokensBefore = estimateContextTokens(buildSessionContext(pathEntries).messages, contextWindow).tokens;
 
 	const cutPoint = findCutPoint(pathEntries, boundaryStart, boundaryEnd, settings.keepRecentTokens);
 

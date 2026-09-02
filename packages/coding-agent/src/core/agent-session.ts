@@ -547,7 +547,11 @@ export class AgentSession {
 		if (
 			!model ||
 			model.contextWindow <= 0 ||
-			!shouldCompact(estimateContextTokens(context.messages).tokens, model.contextWindow, settings)
+			!shouldCompact(
+				estimateContextTokens(context.messages, model.contextWindow).tokens,
+				model.contextWindow,
+				settings,
+			)
 		) {
 			return context;
 		}
@@ -1953,7 +1957,7 @@ export class AgentSession {
 			const pathEntries = this.sessionManager.getBranch();
 			const settings = this.settingsManager.getCompactionSettings();
 
-			const preparation = prepareCompaction(pathEntries, settings);
+			const preparation = prepareCompaction(pathEntries, settings, this.model.contextWindow);
 			if (!preparation) {
 				// Check why we can't compact
 				const lastEntry = pathEntries[pathEntries.length - 1];
@@ -2250,7 +2254,11 @@ export class AgentSession {
 			// this heuristic, not a real, actionable size.
 			contextTokens = Math.min(contextTokens, contextWindow);
 		} else {
-			contextTokens = directContextTokens;
+			// Reject an implausible direct reading (usage.totalTokens exceeding the model's
+			// own context window - physically impossible, see estimateContextTokens' plausibility
+			// guard) in favor of the session's actual message content for this decision.
+			const estimate = estimateContextTokens(this.agent.state.messages, contextWindow);
+			contextTokens = estimate.usageRejected ? Math.min(estimate.tokens, contextWindow) : directContextTokens;
 		}
 		if (shouldCompact(contextTokens, contextWindow, settings)) {
 			return await this._runAutoCompaction("threshold", false);
@@ -2282,7 +2290,7 @@ export class AgentSession {
 
 			const pathEntries = this.sessionManager.getBranch();
 
-			const preparation = prepareCompaction(pathEntries, settings);
+			const preparation = prepareCompaction(pathEntries, settings, this.model.contextWindow);
 			if (!preparation) {
 				return false;
 			}
