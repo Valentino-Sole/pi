@@ -14,6 +14,7 @@ import {
 	findCutPoint,
 	getLastAssistantUsage,
 	prepareCompaction,
+	resolveReportedContextTokens,
 	shouldCompact,
 } from "../src/core/compaction/index.ts";
 import {
@@ -350,6 +351,59 @@ describe("estimateContextTokens", () => {
 
 			expect(warnSpy).toHaveBeenCalledTimes(2);
 		});
+	});
+});
+
+describe("resolveReportedContextTokens", () => {
+	afterEach(() => {
+		clearContextTokensWarningsForTests();
+		vi.restoreAllMocks();
+	});
+
+	// Vets the exact figure the caller holds, rather than re-deriving one from the message
+	// array: the message a caller's figure came from (an aborted or errored turn) is one
+	// estimateContextTokens' own last-valid-usage lookup skips.
+	it("rejects a figure above the context window and returns a message-size estimate instead", () => {
+		const messages: AgentMessage[] = [
+			createUserMessage("Hello"),
+			createAssistantMessage("Hi", createMockUsage(1_700_000, 82_723)),
+		];
+
+		const resolved = resolveReportedContextTokens(1_782_723, messages, 1_000_000);
+
+		expect(resolved.rejected).toBe(true);
+		expect(resolved.tokens).toBeGreaterThan(0);
+		expect(resolved.tokens).toBeLessThan(1_000_000);
+	});
+
+	it("returns an in-range figure untouched", () => {
+		const messages: AgentMessage[] = [createUserMessage("Hello")];
+
+		const resolved = resolveReportedContextTokens(600_000, messages, 1_000_000);
+
+		expect(resolved).toEqual({ tokens: 600_000, rejected: false });
+	});
+
+	it("returns the figure untouched when the context window is unknown", () => {
+		const messages: AgentMessage[] = [createUserMessage("Hello")];
+
+		const resolved = resolveReportedContextTokens(1_782_723, messages, 0);
+
+		expect(resolved).toEqual({ tokens: 1_782_723, rejected: false });
+	});
+
+	it("shares the one-shot per-window warning with estimateContextTokens", () => {
+		const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+		const messages: AgentMessage[] = [
+			createUserMessage("Hello"),
+			createAssistantMessage("Hi", createMockUsage(1_700_000, 82_723)),
+		];
+
+		resolveReportedContextTokens(1_782_723, messages, 1_000_000);
+		estimateContextTokens(messages, 1_000_000);
+
+		expect(warnSpy).toHaveBeenCalledTimes(1);
+		expect(String(warnSpy.mock.calls[0][0])).toContain("1,782,723");
 	});
 });
 

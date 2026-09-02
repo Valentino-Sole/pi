@@ -20,6 +20,7 @@ packages/ai/src/providers/.model-generation-*/
 .zed/
 .idea/
 .claude/
+.squish/
 *.swp
 *.swo
 *~

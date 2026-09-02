@@ -63,6 +63,7 @@ import {
 	estimateTokens,
 	generateBranchSummary,
 	prepareCompaction,
+	resolveReportedContextTokens,
 	shouldCompact,
 } from "./compaction/index.ts";
 import { DEFAULT_THINKING_LEVEL, THINKING_LEVEL_OPTIONS } from "./defaults.ts";
@@ -2207,7 +2208,7 @@ export class AgentSession {
 		const directContextTokens = assistantMessage.usage ? calculateContextTokens(assistantMessage.usage) : 0;
 		if (assistantMessage.stopReason === "error" || directContextTokens === 0) {
 			const messages = this.agent.state.messages;
-			const estimate = estimateContextTokens(messages);
+			const estimate = estimateContextTokens(messages, contextWindow);
 			// Without provider usage, estimate.tokens is the pure message-size estimate.
 			// Only usage-backed estimates need the stale pre-compaction check.
 			if (estimate.lastUsageIndex !== null) {
@@ -2246,8 +2247,14 @@ export class AgentSession {
 			// case this fallback also exists for) still adds trailingTokens as
 			// before: only a confirmed failure or abort narrows the estimate, never
 			// an ordinary response missing its usage field.
+			// A rejected reading leaves no usage baseline to narrow to (estimate.usageTokens is
+			// 0 there), so the message-size fallback in estimate.tokens is the only real figure
+			// available and the narrowing below does not apply.
 			const confirmedFailure = assistantMessage.stopReason === "error" || assistantMessage.stopReason === "aborted";
-			contextTokens = confirmedFailure && estimate.lastUsageIndex !== null ? estimate.usageTokens : estimate.tokens;
+			contextTokens =
+				!estimate.usageRejected && confirmedFailure && estimate.lastUsageIndex !== null
+					? estimate.usageTokens
+					: estimate.tokens;
 			// However it was derived, an estimate can never legitimately exceed the
 			// real context window: the provider would have rejected an over-window
 			// request outright, so anything past that is already an artifact of
@@ -2255,10 +2262,14 @@ export class AgentSession {
 			contextTokens = Math.min(contextTokens, contextWindow);
 		} else {
 			// Reject an implausible direct reading (usage.totalTokens exceeding the model's
-			// own context window - physically impossible, see estimateContextTokens' plausibility
-			// guard) in favor of the session's actual message content for this decision.
-			const estimate = estimateContextTokens(this.agent.state.messages, contextWindow);
-			contextTokens = estimate.usageRejected ? Math.min(estimate.tokens, contextWindow) : directContextTokens;
+			// own context window - physically impossible, see resolveReportedContextTokens)
+			// in favor of the session's actual message content for this decision. The check
+			// has to be against directContextTokens itself: this assistantMessage may be one
+			// estimateContextTokens' own last-valid-usage lookup skips (aborted turns reach
+			// here from the pre-prompt check), so judging that lookup's pick instead would
+			// vet a different message than the one this decision actually uses.
+			const resolved = resolveReportedContextTokens(directContextTokens, this.agent.state.messages, contextWindow);
+			contextTokens = resolved.rejected ? Math.min(resolved.tokens, contextWindow) : resolved.tokens;
 		}
 		if (shouldCompact(contextTokens, contextWindow, settings)) {
 			return await this._runAutoCompaction("threshold", false);

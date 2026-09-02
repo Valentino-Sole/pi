@@ -43,16 +43,21 @@ function usageOf(totalTokens: number, input = totalTokens): Usage {
  * tripping `isContextOverflow`'s separate silent-overflow heuristic (packages/ai), which reads
  * usage.input + usage.cacheRead and is out of this fix's scope.
  */
-function assistantWithUsage(harness: Harness, totalTokens: number, input = 50): AssistantMessage {
+function assistantWithUsage(
+	harness: Harness,
+	totalTokens: number,
+	stopReason: AssistantMessage["stopReason"] = "stop",
+	input = 50,
+): AssistantMessage {
 	const model = harness.getModel();
 	return {
 		role: "assistant",
-		content: [{ type: "text", text: "response" }],
+		content: stopReason === "error" ? [] : [{ type: "text", text: "response" }],
 		api: model.api,
 		provider: model.provider,
 		model: model.id,
 		usage: usageOf(totalTokens, input),
-		stopReason: "stop",
+		stopReason,
 		timestamp: Date.now(),
 	};
 }
@@ -125,6 +130,94 @@ describe("compaction rejects an implausible reported context size (tokensBefore 
 			await sessionInternals._checkCompaction(bogus);
 			await sessionInternals._checkCompaction(bogus);
 
+			const anomalyWarnings = warnSpy.mock.calls.filter((call) => String(call[0]).includes("implausible"));
+			expect(anomalyWarnings).toHaveLength(1);
+			expect(String(anomalyWarnings[0][0])).toContain("1,000");
+		});
+
+		// The pre-prompt check (skipAbortedCheck: false) is the call site that lets an aborted
+		// assistant message reach Case 3's else-branch with its own usage still attached. That
+		// message is exactly one estimateContextTokens' last-valid-usage lookup skips, so a
+		// guard keyed on that lookup would vet an older message - or none at all - and let the
+		// anomalous reading through unclamped.
+		it("does not auto-compact from an aborted turn's own implausible reported total", async () => {
+			const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+			const harness = await createGuardHarness();
+			harnesses.push(harness);
+			const abortedBogus = assistantWithUsage(harness, IMPLAUSIBLE_REPORTED_TOKENS, "aborted");
+			harness.session.agent.state.messages = [
+				{ role: "user", content: [{ type: "text", text: "hi" }], timestamp: Date.now() - 1 },
+				abortedBogus,
+			];
+			const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
+			const runAutoCompactionSpy = vi.spyOn(sessionInternals, "_runAutoCompaction").mockResolvedValue(false);
+
+			await sessionInternals._checkCompaction(abortedBogus, false);
+
+			expect(runAutoCompactionSpy).not.toHaveBeenCalled();
+			expect(warnSpy.mock.calls.filter((call) => String(call[0]).includes("implausible"))).toHaveLength(1);
+		});
+
+		it("rejects an aborted turn's implausible total even when an earlier plausible usage exists to be mistaken for it", async () => {
+			const harness = await createGuardHarness();
+			harnesses.push(harness);
+			// A plausible, well-under-threshold baseline: the message estimateContextTokens'
+			// own lookup would settle on once it skips the aborted turn.
+			const baseline = assistantWithUsage(harness, 68, "stop");
+			const abortedBogus = assistantWithUsage(harness, IMPLAUSIBLE_REPORTED_TOKENS, "aborted");
+			harness.session.agent.state.messages = [
+				{ role: "user", content: [{ type: "text", text: "hi" }], timestamp: Date.now() - 3 },
+				baseline,
+				{ role: "user", content: [{ type: "text", text: "next" }], timestamp: Date.now() - 1 },
+				abortedBogus,
+			];
+			const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
+			const runAutoCompactionSpy = vi.spyOn(sessionInternals, "_runAutoCompaction").mockResolvedValue(false);
+
+			await sessionInternals._checkCompaction(abortedBogus, false);
+
+			expect(runAutoCompactionSpy).not.toHaveBeenCalled();
+		});
+
+		it("still auto-compacts from an aborted turn's plausible reported total (no regression)", async () => {
+			const harness = await createGuardHarness();
+			harnesses.push(harness);
+			// 995 > contextWindow(1000) - reserveTokens(10) = 990
+			const abortedPlausible = assistantWithUsage(harness, 995, "aborted");
+			harness.session.agent.state.messages = [
+				{ role: "user", content: [{ type: "text", text: "hi" }], timestamp: Date.now() - 1 },
+				abortedPlausible,
+			];
+			const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
+			const runAutoCompactionSpy = vi.spyOn(sessionInternals, "_runAutoCompaction").mockResolvedValue(false);
+
+			await sessionInternals._checkCompaction(abortedPlausible, false);
+
+			expect(runAutoCompactionSpy).toHaveBeenCalledWith("threshold", false);
+		});
+
+		// Case 3's if-branch: a later turn failing with stopReason "error" (e.g. a 529) falls
+		// back to the last valid usage - which is the anomalous reading from the turn before.
+		// Clamping that to the window rather than rejecting it pins contextTokens to exactly
+		// the window, which is always over the threshold, so the bogus compaction fires anyway.
+		it("does not auto-compact when a failed turn falls back to an earlier turn's implausible reported total", async () => {
+			const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+			const harness = await createGuardHarness();
+			harnesses.push(harness);
+			const bogus = assistantWithUsage(harness, IMPLAUSIBLE_REPORTED_TOKENS, "stop");
+			const failedTurn = assistantWithUsage(harness, 0, "error", 0);
+			harness.session.agent.state.messages = [
+				{ role: "user", content: [{ type: "text", text: "hi" }], timestamp: Date.now() - 3 },
+				bogus,
+				{ role: "user", content: [{ type: "text", text: "next" }], timestamp: Date.now() - 1 },
+				failedTurn,
+			];
+			const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
+			const runAutoCompactionSpy = vi.spyOn(sessionInternals, "_runAutoCompaction").mockResolvedValue(false);
+
+			await sessionInternals._checkCompaction(failedTurn);
+
+			expect(runAutoCompactionSpy).not.toHaveBeenCalled();
 			const anomalyWarnings = warnSpy.mock.calls.filter((call) => String(call[0]).includes("implausible"));
 			expect(anomalyWarnings).toHaveLength(1);
 			expect(String(anomalyWarnings[0][0])).toContain("1,000");

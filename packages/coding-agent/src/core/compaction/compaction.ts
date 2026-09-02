@@ -185,6 +185,38 @@ export function clearContextTokensWarningsForTests(): void {
 	warnedContextWindows.clear();
 }
 
+function sumMessageTokens(messages: AgentMessage[]): number {
+	let estimated = 0;
+	for (const message of messages) {
+		estimated += estimateTokens(message);
+	}
+	return estimated;
+}
+
+/**
+ * Vet a single provider-reported context-token figure against the model's context window.
+ *
+ * Callers that already hold the exact reported figure they intend to act on must use this
+ * rather than re-deriving one through {@link estimateContextTokens}: that function picks the
+ * *last valid* usage in the array and deliberately skips aborted and errored messages, so it
+ * can end up judging the plausibility of a different message than the one the caller's figure
+ * came from - or of no message at all.
+ *
+ * @returns The reported figure when it is plausible, or a message-size sum over `messages`
+ * (with the one-shot anomaly warning emitted) when it is not.
+ */
+export function resolveReportedContextTokens(
+	reportedTokens: number,
+	messages: AgentMessage[],
+	contextWindow: number,
+): { tokens: number; rejected: boolean } {
+	if (!isImplausibleContextTokens(reportedTokens, contextWindow)) {
+		return { tokens: reportedTokens, rejected: false };
+	}
+	warnImplausibleContextTokens(reportedTokens, contextWindow);
+	return { tokens: sumMessageTokens(messages), rejected: true };
+}
+
 /**
  * Get usage from an assistant message if available.
  * Skips aborted, error, and all-zero usage messages as they don't have valid usage data.
@@ -249,10 +281,7 @@ export function estimateContextTokens(messages: AgentMessage[], contextWindow?: 
 	const usageInfo = getLastAssistantUsageInfo(messages);
 
 	if (!usageInfo) {
-		let estimated = 0;
-		for (const message of messages) {
-			estimated += estimateTokens(message);
-		}
+		const estimated = sumMessageTokens(messages);
 		return {
 			tokens: estimated,
 			usageTokens: 0,
@@ -264,15 +293,11 @@ export function estimateContextTokens(messages: AgentMessage[], contextWindow?: 
 	const reportedUsageTokens = calculateContextTokens(usageInfo.usage);
 
 	if (contextWindow !== undefined && isImplausibleContextTokens(reportedUsageTokens, contextWindow)) {
-		warnImplausibleContextTokens(reportedUsageTokens, contextWindow);
-		let estimated = 0;
-		for (const message of messages) {
-			estimated += estimateTokens(message);
-		}
+		const resolved = resolveReportedContextTokens(reportedUsageTokens, messages, contextWindow);
 		return {
-			tokens: estimated,
+			tokens: resolved.tokens,
 			usageTokens: 0,
-			trailingTokens: estimated,
+			trailingTokens: resolved.tokens,
 			lastUsageIndex: usageInfo.index,
 			usageRejected: true,
 		};
