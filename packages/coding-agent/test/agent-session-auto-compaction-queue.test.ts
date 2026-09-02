@@ -289,9 +289,17 @@ describe("AgentSession auto-compaction queue resume", () => {
 			timestamp: Date.now() + 1000,
 		};
 
+		// The reported-vs-measured plausibility guard rejects a reported total that wildly
+		// overstates the session's real message content, so the leading user message needs
+		// enough real bulk to keep thresholdTokens within the guard's ratio (kept at ~4x,
+		// safely under its 5x threshold) - otherwise the reported figure gets rejected and
+		// replaced by a tiny measured estimate before this test's narrowing behavior ever runs.
+		const bulkTokens = Math.ceil(thresholdTokens / 4);
+		const bulkText = "x".repeat(bulkTokens * 4);
+
 		// Put both messages into agent state so estimateContextTokens can find the successful one
 		session.agent.state.messages = [
-			{ role: "user", content: [{ type: "text", text: "hello" }], timestamp: Date.now() - 1000 },
+			{ role: "user", content: [{ type: "text", text: bulkText }], timestamp: Date.now() - 1000 },
 			successfulAssistant,
 			{ role: "user", content: [{ type: "text", text: "another prompt" }], timestamp: Date.now() + 500 },
 			errorAssistant,

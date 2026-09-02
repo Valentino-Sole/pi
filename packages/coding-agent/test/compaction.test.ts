@@ -298,16 +298,20 @@ describe("estimateContextTokens", () => {
 		});
 
 		it("still trusts a normal in-range reported total (no regression)", () => {
+			// Kept below the reported-vs-measured ratio check's own absolute floor
+			// (MIN_REPORTED_TOKENS_FOR_RATIO_CHECK) so this test stays isolated to the
+			// window-only dimension it was written for; the ratio dimension against
+			// disproportionate real message content gets its own describe block below.
 			const messages: AgentMessage[] = [
 				createUserMessage("Hello"),
-				createAssistantMessage("Hi", createMockUsage(50_000, 10_000)),
+				createAssistantMessage("Hi", createMockUsage(30_000, 10_000)),
 			];
 
 			const estimate = estimateContextTokens(messages, 1_000_000);
 
 			expect(estimate.usageRejected).toBeUndefined();
-			expect(estimate.usageTokens).toBe(60_000);
-			expect(estimate.tokens).toBe(60_000 + estimate.trailingTokens);
+			expect(estimate.usageTokens).toBe(40_000);
+			expect(estimate.tokens).toBe(40_000 + estimate.trailingTokens);
 		});
 
 		it("trusts the reported total as before when the caller does not know the context window", () => {
@@ -352,6 +356,86 @@ describe("estimateContextTokens", () => {
 			expect(second.warning).toBeDefined();
 		});
 	});
+
+	// Reproduces the newer production incident: `[compaction] Compacted from 819,151 tokens`
+	// on a model with a 1,000,000-token context window - below the window, so the PR #3
+	// window-only guard above lets it through - while the session's real content,
+	// independently measured via sumMessageTokens over its own messages, was only ~85,600
+	// tokens (~9.6x smaller). calculateContextTokens()/estimateContextTokens() must not trust
+	// a reported figure that wildly disagrees with the session's own real, measured content,
+	// even when that figure is otherwise plausible against the window alone.
+	describe("plausibility guard against reported-vs-measured deviation", () => {
+		afterEach(() => {
+			clearContextTokensWarningsForTests();
+			vi.restoreAllMocks();
+		});
+
+		it("rejects a reported total far above the session's real measured content even though it stays under the context window", () => {
+			const bulkContent = "x".repeat(342_400); // sumMessageTokens: 342,400 / 4 = 85,600
+			const messages: AgentMessage[] = [
+				createUserMessage(bulkContent),
+				createAssistantMessage("ok", createMockUsage(700_000, 119_151)), // totalTokens 819,151, mirrors the incident
+			];
+
+			const estimate = estimateContextTokens(messages, 1_000_000);
+
+			expect(estimate.usageRejected).toBe(true);
+			expect(estimate.usageTokens).toBe(0);
+			expect(estimate.tokens).toBe(85_601); // measured user content (85,600) + "ok" (1)
+			expect(estimate.tokens).toBeLessThan(1_000_000);
+		});
+
+		it("still trusts a reported total that stays within a plausible multiple of the real measured content (no false positive)", () => {
+			// Ratio here (~3x) stays under the implausibility ratio - consistent with ordinary
+			// system-prompt/tool-definition overhead that sumMessageTokens never sees (it only
+			// measures `messages`, never the system prompt or tool definitions).
+			const bulkContent = "x".repeat(200_000); // sumMessageTokens: 200,000 / 4 = 50,000
+			const messages: AgentMessage[] = [
+				createUserMessage(bulkContent),
+				createAssistantMessage("ok", createMockUsage(140_000, 10_000)), // totalTokens 150,000
+			];
+
+			const estimate = estimateContextTokens(messages, 1_000_000);
+
+			expect(estimate.usageRejected).toBeUndefined();
+			expect(estimate.usageTokens).toBe(150_000);
+			expect(estimate.tokens).toBe(150_000);
+		});
+
+		it("does not apply the ratio check below the reported-figure floor, even with a large ratio", () => {
+			// A reported figure this small could never meaningfully move shouldCompact() or a
+			// displayed percent against a real model window, so a large ratio here is not worth
+			// flagging - this is what keeps an early, short session (small real content, but a
+			// legitimate reported figure carrying fixed system-prompt/tool-definition overhead)
+			// from being misjudged as implausible.
+			const messages: AgentMessage[] = [
+				createUserMessage("hi"),
+				createAssistantMessage("ok", createMockUsage(30_000, 5_000)), // totalTokens 35,000
+			];
+
+			const estimate = estimateContextTokens(messages, 1_000_000);
+
+			expect(estimate.usageRejected).toBeUndefined();
+			expect(estimate.usageTokens).toBe(35_000);
+		});
+
+		it("surfaces a reported-vs-measured rejection once, naming the reported figure, the measured figure, and the window", () => {
+			const bulkContent = "x".repeat(342_400);
+			const messages: AgentMessage[] = [
+				createUserMessage(bulkContent),
+				createAssistantMessage("ok", createMockUsage(700_000, 119_151)),
+			];
+
+			const first = estimateContextTokens(messages, 1_000_000);
+			const second = estimateContextTokens(messages, 1_000_000);
+
+			expect(first.warning).toBeDefined();
+			expect(first.warning).toContain("819,151");
+			expect(first.warning).toContain("85,601");
+			expect(first.warning).toContain("1,000,000");
+			expect(second.warning).toBeUndefined();
+		});
+	});
 });
 
 describe("resolveReportedContextTokens", () => {
@@ -377,11 +461,14 @@ describe("resolveReportedContextTokens", () => {
 	});
 
 	it("returns an in-range figure untouched", () => {
+		// Kept below the reported-vs-measured ratio check's own absolute floor
+		// (MIN_REPORTED_TOKENS_FOR_RATIO_CHECK) so this test stays isolated to the
+		// window-only dimension; the ratio dimension gets its own tests below.
 		const messages: AgentMessage[] = [createUserMessage("Hello")];
 
-		const resolved = resolveReportedContextTokens(600_000, messages, 1_000_000);
+		const resolved = resolveReportedContextTokens(40_000, messages, 1_000_000);
 
-		expect(resolved).toEqual({ tokens: 600_000, rejected: false });
+		expect(resolved).toEqual({ tokens: 40_000, rejected: false });
 	});
 
 	it("returns the figure untouched when the context window is unknown", () => {
@@ -405,12 +492,40 @@ describe("resolveReportedContextTokens", () => {
 		expect(resolved.warning).toContain("1,782,723");
 		expect(estimate.warning).toBeUndefined();
 	});
+
+	// Mirrors the newer production incident (819,151 reported vs ~85,600 real measured
+	// content, both under a 1,000,000-token window) at this function's own level, since
+	// callers like Case 3's else-branch in agent-session.ts vet an exact figure they already
+	// hold rather than re-deriving one through estimateContextTokens.
+	it("rejects a figure far above the real measured content even though it is below the window", () => {
+		const messages: AgentMessage[] = [createUserMessage("x".repeat(342_400))]; // measures to 85,600
+
+		const resolved = resolveReportedContextTokens(819_151, messages, 1_000_000);
+
+		expect(resolved.rejected).toBe(true);
+		expect(resolved.tokens).toBe(85_600);
+		expect(resolved.warning).toContain("819,151");
+		expect(resolved.warning).toContain("85,600");
+	});
+
+	it("returns a figure that stays within a plausible multiple of the real measured content untouched", () => {
+		const messages: AgentMessage[] = [createUserMessage("x".repeat(200_000))]; // measures to 50,000
+
+		const resolved = resolveReportedContextTokens(150_000, messages, 1_000_000); // ratio ~3x
+
+		expect(resolved).toEqual({ tokens: 150_000, rejected: false });
+	});
 });
 
 describe("prepareCompaction with a context window", () => {
 	// Small keepRecentTokens forces a real cut point so there is content to summarize -
 	// matches the convention in "should re-summarize previously kept messages..." above.
 	const forceCutSettings: CompactionSettings = { ...DEFAULT_COMPACTION_SETTINGS, keepRecentTokens: 10 };
+
+	afterEach(() => {
+		clearContextTokensWarningsForTests();
+		vi.restoreAllMocks();
+	});
 
 	it("rejects an implausible tokensBefore and falls back to a message-size estimate", () => {
 		const u1 = createMessageEntry(createUserMessage("hello ".repeat(20)));
@@ -438,6 +553,48 @@ describe("prepareCompaction with a context window", () => {
 
 		expect(withWindow).toBeDefined();
 		expect(withWindow!.tokensBefore).toBe(withoutWindow!.tokensBefore);
+	});
+
+	// Mirrors the newer production incident end to end through prepareCompaction() itself
+	// (not just estimateContextTokens()/resolveReportedContextTokens() in isolation): a
+	// tokensBefore this implausible must never reach the persisted compaction entry that
+	// the TUI renders as "[compaction] Compacted from N tokens". The bulk content sits in
+	// an earlier turn (not the final entry) so there is still real content left to
+	// summarize once the tiny keepRecentTokens forces a cut - mirroring the four-entry shape
+	// of the window-only test above rather than the two-entry shape that would leave nothing
+	// to cut once the huge first message is itself the only thing keepRecentTokens can keep.
+	it("rejects a tokensBefore far above the real measured content even though it is below the window", () => {
+		const u0 = createMessageEntry(createUserMessage("intro"));
+		const a0 = createMessageEntry(createAssistantMessage("ack"));
+		const u1 = createMessageEntry(createUserMessage("x".repeat(342_400))); // measures to 85,600
+		const a1 = createMessageEntry(
+			createAssistantMessage("ok", createMockUsage(700_000, 119_151)), // totalTokens 819,151
+		);
+
+		const preparation = prepareCompaction([u0, a0, u1, a1], forceCutSettings, 1_000_000);
+
+		expect(preparation).toBeDefined();
+		expect(preparation!.tokensBefore).not.toBe(819_151);
+		expect(preparation!.tokensBefore).toBeLessThan(1_000_000);
+		expect(preparation!.tokensBeforeWarning).toContain("819,151");
+	});
+
+	it("still uses a tokensBefore that stays within a plausible multiple of the real measured content (no false positive)", () => {
+		const u0 = createMessageEntry(createUserMessage("intro"));
+		const a0 = createMessageEntry(createAssistantMessage("ack"));
+		const u1 = createMessageEntry(createUserMessage("x".repeat(200_000))); // measures to 50,000
+		const a1 = createMessageEntry(
+			createAssistantMessage("ok", createMockUsage(140_000, 10_000)), // totalTokens 150,000, ratio ~3x
+		);
+
+		const preparation = prepareCompaction([u0, a0, u1, a1], forceCutSettings, 1_000_000);
+
+		expect(preparation).toBeDefined();
+		// The reported usage sits on the final entry, so trailingTokens is 0 regardless of
+		// how much bulk content the earlier turns carry - tokensBefore is exactly the
+		// trusted reported figure.
+		expect(preparation!.tokensBefore).toBe(150_000);
+		expect(preparation!.tokensBeforeWarning).toBeUndefined();
 	});
 });
 

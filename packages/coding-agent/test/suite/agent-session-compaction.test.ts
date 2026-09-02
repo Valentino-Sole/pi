@@ -797,9 +797,12 @@ describe("AgentSession compaction characterization", () => {
 		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
 		// 120,000: above the default harness model's 128,000-token window minus the default
 		// 16,384-token reserve (111,616), so this still crosses the compaction threshold, but
-		// below the window itself, so the plausibility guard does not reject it as implausible
-		// and replace it with a tiny message-size estimate - this test is about the narrowing
-		// to the last successful usage on a later error, not about the plausibility guard.
+		// below the window itself, so the above-window plausibility check does not reject it.
+		// The user message below carries enough real bulk content (~30,000 measured tokens)
+		// to also stay within the reported-vs-measured ratio guard's 5x threshold - this test
+		// is about the narrowing to the last successful usage on a later error, not about the
+		// plausibility guard, so the reported figure must read as genuinely plausible on both
+		// checks for the narrowing behavior under test to actually run.
 		const successfulAssistant = createAssistant(harness, {
 			stopReason: "stop",
 			totalTokens: 120_000,
@@ -811,7 +814,11 @@ describe("AgentSession compaction characterization", () => {
 			timestamp: Date.now() + 1000,
 		});
 		harness.session.agent.state.messages = [
-			{ role: "user", content: [{ type: "text", text: "hello" }], timestamp: Date.now() - 1000 },
+			{
+				role: "user",
+				content: [{ type: "text", text: `hello ${"x".repeat(120_000)}` }],
+				timestamp: Date.now() - 1000,
+			},
 			successfulAssistant,
 			{ role: "user", content: [{ type: "text", text: "retry" }], timestamp: Date.now() + 500 },
 			errorAssistant,
