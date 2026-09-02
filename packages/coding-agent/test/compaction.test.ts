@@ -323,33 +323,33 @@ describe("estimateContextTokens", () => {
 		});
 
 		it("surfaces the rejection once via a warning naming the rejected value and the context window", () => {
-			const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
 			const messages: AgentMessage[] = [
 				createUserMessage("Hello"),
 				createAssistantMessage("Hi", createMockUsage(1_700_000, 82_723)),
 			];
 
-			estimateContextTokens(messages, 1_000_000);
-			estimateContextTokens(messages, 1_000_000);
-			estimateContextTokens(messages, 1_000_000);
+			const first = estimateContextTokens(messages, 1_000_000);
+			const second = estimateContextTokens(messages, 1_000_000);
+			const third = estimateContextTokens(messages, 1_000_000);
 
-			expect(warnSpy).toHaveBeenCalledTimes(1);
-			const warningText = String(warnSpy.mock.calls[0][0]);
-			expect(warningText).toContain("1,782,723");
-			expect(warningText).toContain("1,000,000");
+			expect(first.warning).toBeDefined();
+			expect(first.warning).toContain("1,782,723");
+			expect(first.warning).toContain("1,000,000");
+			expect(second.warning).toBeUndefined();
+			expect(third.warning).toBeUndefined();
 		});
 
 		it("warns again for a different context window (not globally suppressed)", () => {
-			const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
 			const messages: AgentMessage[] = [
 				createUserMessage("Hello"),
 				createAssistantMessage("Hi", createMockUsage(1_700_000, 82_723)),
 			];
 
-			estimateContextTokens(messages, 1_000_000);
-			estimateContextTokens(messages, 500_000);
+			const first = estimateContextTokens(messages, 1_000_000);
+			const second = estimateContextTokens(messages, 500_000);
 
-			expect(warnSpy).toHaveBeenCalledTimes(2);
+			expect(first.warning).toBeDefined();
+			expect(second.warning).toBeDefined();
 		});
 	});
 });
@@ -393,17 +393,17 @@ describe("resolveReportedContextTokens", () => {
 	});
 
 	it("shares the one-shot per-window warning with estimateContextTokens", () => {
-		const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
 		const messages: AgentMessage[] = [
 			createUserMessage("Hello"),
 			createAssistantMessage("Hi", createMockUsage(1_700_000, 82_723)),
 		];
 
-		resolveReportedContextTokens(1_782_723, messages, 1_000_000);
-		estimateContextTokens(messages, 1_000_000);
+		const resolved = resolveReportedContextTokens(1_782_723, messages, 1_000_000);
+		const estimate = estimateContextTokens(messages, 1_000_000);
 
-		expect(warnSpy).toHaveBeenCalledTimes(1);
-		expect(String(warnSpy.mock.calls[0][0])).toContain("1,782,723");
+		expect(resolved.warning).toBeDefined();
+		expect(resolved.warning).toContain("1,782,723");
+		expect(estimate.warning).toBeUndefined();
 	});
 });
 

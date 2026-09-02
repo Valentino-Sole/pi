@@ -541,19 +541,29 @@ export class AgentSession {
 		};
 	}
 
+	/**
+	 * Print a one-shot implausible-context-tokens warning (see compaction.ts's
+	 * `formatImplausibleContextTokensWarning`), but only when no UI owns the terminal - a raw
+	 * stdout write would land in a live TUI's managed alternate-screen region and corrupt the
+	 * render, mirroring the existing `!hasUI()`-gated `console.warn` in extensions/runner.ts.
+	 */
+	private _reportImplausibleContextWarning(warning: string | undefined): void {
+		if (warning && !this._extensionRunner.hasUI()) {
+			console.warn(warning);
+		}
+	}
+
 	private async _compactBeforeNextAssistantResponse(context: AgentContext): Promise<AgentContext> {
 		const model = this.model;
 		const settings = this.settingsManager.getCompactionSettings();
 
-		if (
-			!model ||
-			model.contextWindow <= 0 ||
-			!shouldCompact(
-				estimateContextTokens(context.messages, model.contextWindow).tokens,
-				model.contextWindow,
-				settings,
-			)
-		) {
+		if (!model || model.contextWindow <= 0) {
+			return context;
+		}
+
+		const estimate = estimateContextTokens(context.messages, model.contextWindow);
+		this._reportImplausibleContextWarning(estimate.warning);
+		if (!shouldCompact(estimate.tokens, model.contextWindow, settings)) {
 			return context;
 		}
 
@@ -1967,6 +1977,7 @@ export class AgentSession {
 				}
 				throw new Error("Nothing to compact (session too small)");
 			}
+			this._reportImplausibleContextWarning(preparation.tokensBeforeWarning);
 
 			let extensionCompaction: CompactionResult | undefined;
 
@@ -2144,6 +2155,13 @@ export class AgentSession {
 		const sameModel =
 			this.model && assistantMessage.provider === this.model.provider && assistantMessage.model === this.model.id;
 
+		// Case 3's plausibility guard below (like the overflow check above) only means anything
+		// against the currently-selected model's own window. Without this, a reading that was
+		// entirely legitimate under a previously-selected model (e.g. 400,000 tokens on a
+		// 1,000,000-token model) could be misjudged "implausible" purely because the user has
+		// since switched to a smaller-window model, and get rejected/warned about for no reason.
+		const plausibilityWindow = sameModel ? contextWindow : undefined;
+
 		// Skip compaction checks if this assistant message is older than the latest
 		// compaction boundary. This prevents a stale pre-compaction usage/error
 		// from retriggering compaction on the first prompt after compaction.
@@ -2208,7 +2226,8 @@ export class AgentSession {
 		const directContextTokens = assistantMessage.usage ? calculateContextTokens(assistantMessage.usage) : 0;
 		if (assistantMessage.stopReason === "error" || directContextTokens === 0) {
 			const messages = this.agent.state.messages;
-			const estimate = estimateContextTokens(messages, contextWindow);
+			const estimate = estimateContextTokens(messages, plausibilityWindow);
+			this._reportImplausibleContextWarning(estimate.warning);
 			// Without provider usage, estimate.tokens is the pure message-size estimate.
 			// Only usage-backed estimates need the stale pre-compaction check.
 			if (estimate.lastUsageIndex !== null) {
@@ -2260,7 +2279,7 @@ export class AgentSession {
 			// request outright, so anything past that is already an artifact of
 			// this heuristic, not a real, actionable size.
 			contextTokens = Math.min(contextTokens, contextWindow);
-		} else {
+		} else if (plausibilityWindow !== undefined) {
 			// Reject an implausible direct reading (usage.totalTokens exceeding the model's
 			// own context window - physically impossible, see resolveReportedContextTokens)
 			// in favor of the session's actual message content for this decision. The check
@@ -2268,8 +2287,15 @@ export class AgentSession {
 			// estimateContextTokens' own last-valid-usage lookup skips (aborted turns reach
 			// here from the pre-prompt check), so judging that lookup's pick instead would
 			// vet a different message than the one this decision actually uses.
-			const resolved = resolveReportedContextTokens(directContextTokens, this.agent.state.messages, contextWindow);
-			contextTokens = resolved.rejected ? Math.min(resolved.tokens, contextWindow) : resolved.tokens;
+			const resolved = resolveReportedContextTokens(
+				directContextTokens,
+				this.agent.state.messages,
+				plausibilityWindow,
+			);
+			this._reportImplausibleContextWarning(resolved.warning);
+			contextTokens = resolved.rejected ? Math.min(resolved.tokens, plausibilityWindow) : resolved.tokens;
+		} else {
+			contextTokens = directContextTokens;
 		}
 		if (shouldCompact(contextTokens, contextWindow, settings)) {
 			return await this._runAutoCompaction("threshold", false);
@@ -2305,6 +2331,7 @@ export class AgentSession {
 			if (!preparation) {
 				return false;
 			}
+			this._reportImplausibleContextWarning(preparation.tokensBeforeWarning);
 
 			this._emit({ type: "compaction_start", reason });
 			this._autoCompactionAbortController = new AbortController();

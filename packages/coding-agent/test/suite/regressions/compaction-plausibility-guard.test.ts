@@ -1,6 +1,7 @@
 import { type AssistantMessage, fauxAssistantMessage, type Usage } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { clearContextTokensWarningsForTests } from "../../../src/core/compaction/index.ts";
+import type { ExtensionUIContext } from "../../../src/core/extensions/types.ts";
 import type { CompactionEntry } from "../../../src/core/session-manager.ts";
 import { createHarness, type Harness } from "../harness.ts";
 
@@ -221,6 +222,75 @@ describe("compaction rejects an implausible reported context size (tokensBefore 
 			const anomalyWarnings = warnSpy.mock.calls.filter((call) => String(call[0]).includes("implausible"));
 			expect(anomalyWarnings).toHaveLength(1);
 			expect(String(anomalyWarnings[0][0])).toContain("1,000");
+		});
+
+		// A raw console.warn from a live session would land inside a TUI's managed
+		// alternate-screen region and corrupt the render (see extensions/runner.ts:551 for the
+		// same established !hasUI() gating this mirrors). The rejection must still govern the
+		// compaction decision either way - only the raw stdout write is suppressed.
+		it("suppresses the console warning while a UI owns the terminal, without changing the rejection decision", async () => {
+			const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+			const harness = await createGuardHarness();
+			harnesses.push(harness);
+			harness.session.extensionRunner.setUIContext({} as ExtensionUIContext, "tui");
+			const bogus = assistantWithUsage(harness, IMPLAUSIBLE_REPORTED_TOKENS);
+			harness.session.agent.state.messages = [
+				{ role: "user", content: [{ type: "text", text: "hi" }], timestamp: Date.now() - 1 },
+				bogus,
+			];
+			const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
+			const runAutoCompactionSpy = vi.spyOn(sessionInternals, "_runAutoCompaction").mockResolvedValue(false);
+
+			await sessionInternals._checkCompaction(bogus);
+
+			expect(runAutoCompactionSpy).not.toHaveBeenCalled();
+			expect(warnSpy.mock.calls.filter((call) => String(call[0]).includes("implausible"))).toHaveLength(0);
+		});
+
+		// Unlike the overflow branch a few lines above (which already skips entirely when the
+		// message came from a different model), Case 3's plausibility guard did not check
+		// sameModel at all: a perfectly legitimate reading from a previously-selected model could
+		// be misjudged "implausible" purely because the user has since switched to a
+		// smaller-window model. The reading may still legitimately exceed the new window and
+		// trigger compaction on its own merits - what must not happen is treating a real number
+		// as a reporting anomaly it never was.
+		it("does not misjudge a legitimate reading from a previously-selected model as implausible against the newly-selected model's window", async () => {
+			const harness = await createHarness({
+				models: [
+					{ id: "big-model", contextWindow: 1_000_000, maxTokens: 200 },
+					{ id: "small-model", contextWindow: 1000, maxTokens: 200 },
+				],
+				settings: { compaction: { enabled: true, reserveTokens: 10 } },
+			});
+			harnesses.push(harness);
+			const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+			const bigModel = harness.getModel("big-model")!;
+			// Legitimate under the big model: 400,000 is well within its 1,000,000-token window.
+			const legitimateUnderBigModel: AssistantMessage = {
+				role: "assistant",
+				content: [{ type: "text", text: "response" }],
+				api: bigModel.api,
+				provider: bigModel.provider,
+				model: bigModel.id,
+				usage: usageOf(400_000),
+				stopReason: "stop",
+				timestamp: Date.now(),
+			};
+			harness.session.agent.state.messages = [
+				{ role: "user", content: [{ type: "text", text: "hi" }], timestamp: Date.now() - 1 },
+				legitimateUnderBigModel,
+			];
+
+			await harness.session.setModel(harness.getModel("small-model")!);
+			const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
+			vi.spyOn(sessionInternals, "_runAutoCompaction").mockResolvedValue(false);
+
+			// sameModel is false here (legitimateUnderBigModel.model is "big-model", the session's
+			// current model is now "small-model"), so the plausibility guard must not fire.
+			await sessionInternals._checkCompaction(legitimateUnderBigModel, false);
+
+			expect(warnSpy.mock.calls.filter((call) => String(call[0]).includes("implausible"))).toHaveLength(0);
 		});
 	});
 

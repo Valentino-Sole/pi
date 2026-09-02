@@ -162,22 +162,34 @@ function isImplausibleContextTokens(tokens: number, contextWindow: number): bool
 }
 
 /**
- * Surface a rejected provider usage figure once per distinct context window per process,
- * mirroring the one-shot pattern used for deprecation warnings (see utils/deprecation.ts).
- * A still-affected provider stream tends to keep reporting anomalous readings on every
- * subsequent turn (per the production incident this guards against), so deduping per-window
- * rather than per-exact-value avoids re-warning every turn while still surfacing the anomaly.
+ * Format the one-shot implausible-context-tokens warning message. This module has no notion
+ * of whether a live UI currently owns the terminal (a raw stdout write would corrupt a TUI's
+ * managed alternate-screen render - see `ExtensionRunner.hasUI()` and its existing gated
+ * `console.warn` at extensions/runner.ts:551 for the established precedent), so formatting is
+ * kept separate from printing: callers that know their own UI context render this string
+ * through `console.warn()` themselves, only when appropriate.
  */
-function warnImplausibleContextTokens(reportedTokens: number, contextWindow: number): void {
-	if (warnedContextWindows.has(contextWindow)) return;
-	warnedContextWindows.add(contextWindow);
-	console.warn(
-		chalk.yellow(
-			`Warning: provider-reported context usage (${reportedTokens.toLocaleString()} tokens) exceeds the ` +
-				`model's context window (${contextWindow.toLocaleString()} tokens) and was rejected as implausible; ` +
-				`using a message-size estimate instead.`,
-		),
+export function formatImplausibleContextTokensWarning(reportedTokens: number, contextWindow: number): string {
+	return chalk.yellow(
+		`Warning: provider-reported context usage (${reportedTokens.toLocaleString()} tokens) exceeds the ` +
+			`model's context window (${contextWindow.toLocaleString()} tokens) and was rejected as implausible; ` +
+			`using a message-size estimate instead.`,
 	);
+}
+
+/**
+ * One-shot gate for surfacing a rejected provider usage figure, per distinct context window
+ * per process, mirroring the dedup pattern used for deprecation warnings (see
+ * utils/deprecation.ts). A still-affected provider stream tends to keep reporting anomalous
+ * readings on every subsequent turn (per the production incident this guards against), so
+ * deduping per-window rather than per-exact-value avoids re-warning every turn while still
+ * surfacing the anomaly. Consuming the gate (returning true) does not depend on whether the
+ * caller actually goes on to print anything.
+ */
+function shouldAnnounceImplausibleContextTokens(contextWindow: number): boolean {
+	if (warnedContextWindows.has(contextWindow)) return false;
+	warnedContextWindows.add(contextWindow);
+	return true;
 }
 
 /** Clear one-shot implausible-context-tokens warning state. Exported for tests. */
@@ -203,18 +215,22 @@ function sumMessageTokens(messages: AgentMessage[]): number {
  * came from - or of no message at all.
  *
  * @returns The reported figure when it is plausible, or a message-size sum over `messages`
- * (with the one-shot anomaly warning emitted) when it is not.
+ * when it is not. `warning` carries the one-shot anomaly message (only on the first rejection
+ * for this context window) for the caller to print through its own UI-aware channel - this
+ * function never writes to the console itself.
  */
 export function resolveReportedContextTokens(
 	reportedTokens: number,
 	messages: AgentMessage[],
 	contextWindow: number,
-): { tokens: number; rejected: boolean } {
+): { tokens: number; rejected: boolean; warning?: string } {
 	if (!isImplausibleContextTokens(reportedTokens, contextWindow)) {
 		return { tokens: reportedTokens, rejected: false };
 	}
-	warnImplausibleContextTokens(reportedTokens, contextWindow);
-	return { tokens: sumMessageTokens(messages), rejected: true };
+	const warning = shouldAnnounceImplausibleContextTokens(contextWindow)
+		? formatImplausibleContextTokensWarning(reportedTokens, contextWindow)
+		: undefined;
+	return { tokens: sumMessageTokens(messages), rejected: true, warning };
 }
 
 /**
@@ -257,6 +273,8 @@ export interface ContextUsageEstimate {
 	lastUsageIndex: number | null;
 	/** True when the reported usage exceeded the model's context window and was rejected as implausible. */
 	usageRejected?: boolean;
+	/** One-shot anomaly message when `usageRejected` is true and this is the first such rejection for this context window - print through the caller's own UI-aware channel. */
+	warning?: string;
 }
 
 function getLastAssistantUsageInfo(messages: AgentMessage[]): { usage: Usage; index: number } | undefined {
@@ -300,6 +318,7 @@ export function estimateContextTokens(messages: AgentMessage[], contextWindow?: 
 			trailingTokens: resolved.tokens,
 			lastUsageIndex: usageInfo.index,
 			usageRejected: true,
+			warning: resolved.warning,
 		};
 	}
 
@@ -826,6 +845,8 @@ export interface CompactionPreparation {
 	/** Whether this is a split turn (cut point in middle of turn) */
 	isSplitTurn: boolean;
 	tokensBefore: number;
+	/** One-shot anomaly message when the reported tokensBefore figure was rejected as implausible and this is the first such rejection for this context window - print through the caller's own UI-aware channel. */
+	tokensBeforeWarning?: string;
 	/** Summary from previous compaction, for iterative update */
 	previousSummary?: string;
 	/** File operations extracted from messagesToSummarize */
@@ -861,7 +882,9 @@ export function prepareCompaction(
 	}
 	const boundaryEnd = pathEntries.length;
 
-	const tokensBefore = estimateContextTokens(buildSessionContext(pathEntries).messages, contextWindow).tokens;
+	const tokensBeforeEstimate = estimateContextTokens(buildSessionContext(pathEntries).messages, contextWindow);
+	const tokensBefore = tokensBeforeEstimate.tokens;
+	const tokensBeforeWarning = tokensBeforeEstimate.warning;
 
 	const cutPoint = findCutPoint(pathEntries, boundaryStart, boundaryEnd, settings.keepRecentTokens);
 
@@ -910,6 +933,7 @@ export function prepareCompaction(
 		turnPrefixMessages,
 		isSplitTurn: cutPoint.isSplitTurn,
 		tokensBefore,
+		tokensBeforeWarning,
 		previousSummary,
 		fileOps,
 		settings,
