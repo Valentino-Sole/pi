@@ -351,3 +351,154 @@ describe("compaction rejects an implausible reported context size (tokensBefore 
 		});
 	});
 });
+
+// Reported shape: a session's `[compaction] Compacted from 819,151 tokens` entry on a model
+// with a 1,000,000-token context window - comfortably under the window, so the window-only
+// guard above (PR #3) lets it through - while the session's real content, independently
+// measured via sumMessageTokens over its own messages, was only ~85,600 tokens (~9.6x
+// smaller). Traced to calculateContextTokens()/estimateContextTokens() trusting any reported
+// usage.totalTokens under the window at face value, with no check against what the session
+// itself could plausibly contain. The above-window guard is a special case of this same
+// question, not an independent check - both live behind one `isImplausibleContextTokens()`.
+describe("compaction rejects a reported context size that wildly overstates the session's real measured content (819,151 vs ~85,600 measured, both under a 1,000,000-token window)", () => {
+	const harnesses: Harness[] = [];
+
+	afterEach(() => {
+		vi.restoreAllMocks();
+		clearContextTokensWarningsForTests();
+		while (harnesses.length > 0) {
+			harnesses.pop()?.cleanup();
+		}
+	});
+
+	const RATIO_CONTEXT_WINDOW = 1_000_000;
+	const RATIO_IMPLAUSIBLE_REPORTED_TOKENS = 819_151;
+	// sumMessageTokens: 342,400 / 4 = 85,600 - matches the incident's real measured content.
+	const BULK_CONTENT = "x".repeat(342_400);
+
+	async function createRatioGuardHarness(): Promise<Harness> {
+		return createHarness({
+			models: [{ id: "faux-1", contextWindow: RATIO_CONTEXT_WINDOW, maxTokens: 200 }],
+			settings: { compaction: { enabled: true, reserveTokens: 10 } },
+		});
+	}
+
+	describe("_checkCompaction trigger decision", () => {
+		it("does not auto-compact from a reported total that wildly overstates the real measured content", async () => {
+			const harness = await createRatioGuardHarness();
+			harnesses.push(harness);
+			const bogus = assistantWithUsage(harness, RATIO_IMPLAUSIBLE_REPORTED_TOKENS);
+			harness.session.agent.state.messages = [
+				{ role: "user", content: [{ type: "text", text: BULK_CONTENT }], timestamp: Date.now() - 1 },
+				bogus,
+			];
+			const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
+			const runAutoCompactionSpy = vi.spyOn(sessionInternals, "_runAutoCompaction").mockResolvedValue(false);
+
+			await sessionInternals._checkCompaction(bogus);
+
+			expect(runAutoCompactionSpy).not.toHaveBeenCalled();
+		});
+
+		it("surfaces the rejection once, naming both the reported and measured figures", async () => {
+			const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+			const harness = await createRatioGuardHarness();
+			harnesses.push(harness);
+			const bogus = assistantWithUsage(harness, RATIO_IMPLAUSIBLE_REPORTED_TOKENS);
+			harness.session.agent.state.messages = [
+				{ role: "user", content: [{ type: "text", text: BULK_CONTENT }], timestamp: Date.now() - 1 },
+				bogus,
+			];
+			const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
+			vi.spyOn(sessionInternals, "_runAutoCompaction").mockResolvedValue(false);
+
+			await sessionInternals._checkCompaction(bogus);
+			await sessionInternals._checkCompaction(bogus);
+			await sessionInternals._checkCompaction(bogus);
+
+			const anomalyWarnings = warnSpy.mock.calls.filter((call) => String(call[0]).includes("implausible"));
+			expect(anomalyWarnings).toHaveLength(1);
+			expect(String(anomalyWarnings[0][0])).toContain("819,151");
+			expect(String(anomalyWarnings[0][0])).toContain("85,60");
+		});
+
+		it("still auto-compacts when the reported total stays within a plausible multiple of the real measured content (no regression)", async () => {
+			// A smaller window keeps this test's numbers legible: reserveTokens is tiny, so
+			// almost the full window must be reported to cross the threshold, while the
+			// measured content (~50,000, from a 200,000-char message) stays comfortably
+			// inside the 5x ratio (199,995 / 50,000 ~= 4x) - both conditions a real, healthy
+			// session nearing its context limit would actually show.
+			const harness = await createHarness({
+				models: [{ id: "faux-2", contextWindow: 200_000, maxTokens: 200 }],
+				settings: { compaction: { enabled: true, reserveTokens: 10 } },
+			});
+			harnesses.push(harness);
+			const plausible = assistantWithUsage(harness, 199_995);
+			harness.session.agent.state.messages = [
+				{ role: "user", content: [{ type: "text", text: "x".repeat(200_000) }], timestamp: Date.now() - 1 },
+				plausible,
+			];
+			const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
+			const runAutoCompactionSpy = vi.spyOn(sessionInternals, "_runAutoCompaction").mockResolvedValue(false);
+
+			await sessionInternals._checkCompaction(plausible);
+
+			expect(runAutoCompactionSpy).toHaveBeenCalledWith("threshold", false);
+		});
+	});
+
+	describe("manual compact() end to end", () => {
+		function seedSession(harness: Harness, totalTokens: number, bulkContent: string): void {
+			harness.settingsManager.applyOverrides({ compaction: { keepRecentTokens: 1 } });
+			const now = Date.now();
+			harness.sessionManager.appendMessage({
+				role: "user",
+				content: [{ type: "text", text: bulkContent }],
+				timestamp: now - 1000,
+			});
+			const model = harness.getModel();
+			const assistant: AssistantMessage = {
+				role: "assistant",
+				content: [{ type: "text", text: "assistant response to compact" }],
+				api: model.api,
+				provider: model.provider,
+				model: model.id,
+				usage: usageOf(totalTokens),
+				stopReason: "stop",
+				timestamp: now - 500,
+			};
+			harness.sessionManager.appendMessage(assistant);
+			harness.session.agent.state.messages = harness.sessionManager.buildSessionContext().messages;
+		}
+
+		it("rejects an implausible reported tokensBefore that is below the window and still compacts end to end from the real measured content", async () => {
+			const harness = await createRatioGuardHarness();
+			harnesses.push(harness);
+			seedSession(harness, RATIO_IMPLAUSIBLE_REPORTED_TOKENS, BULK_CONTENT);
+			harness.setResponses([fauxAssistantMessage("summary of prior work")]);
+
+			const result = await harness.session.compact();
+
+			expect(result.tokensBefore).not.toBe(RATIO_IMPLAUSIBLE_REPORTED_TOKENS);
+			expect(result.tokensBefore).toBeGreaterThan(0);
+			expect(result.tokensBefore).toBeLessThan(RATIO_CONTEXT_WINDOW);
+			const compactionEntries = harness.sessionManager.getEntries().filter((entry) => entry.type === "compaction");
+			expect(compactionEntries).toHaveLength(1);
+			expect((compactionEntries[0] as CompactionEntry).tokensBefore).toBe(result.tokensBefore);
+		});
+
+		it("compacts correctly end to end when the reported value stays within a plausible multiple of the real measured content (no regression)", async () => {
+			const harness = await createRatioGuardHarness();
+			harnesses.push(harness);
+			seedSession(harness, 150_000, "x".repeat(200_000)); // measures to ~50,000; ratio ~3x
+			harness.setResponses([fauxAssistantMessage("summary of prior work")]);
+
+			const result = await harness.session.compact();
+
+			expect(result.tokensBefore).toBe(150_000);
+			const compactionEntries = harness.sessionManager.getEntries().filter((entry) => entry.type === "compaction");
+			expect(compactionEntries).toHaveLength(1);
+			expect((compactionEntries[0] as CompactionEntry).tokensBefore).toBe(150_000);
+		});
+	});
+});

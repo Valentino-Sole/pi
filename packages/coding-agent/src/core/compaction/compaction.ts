@@ -151,14 +151,55 @@ export function calculateContextTokens(usage: Usage): number {
 const warnedContextWindows = new Set<number>();
 
 /**
- * A provider-reported context-token figure can never legitimately exceed the model's own
- * context window - the API would refuse a request that large outright. When it does, the
- * report itself is the anomaly (observed in production as a `claude-code-cli` usage.totalTokens
- * reading ~78% over the model's 1M window, in the same order of magnitude as an accumulating
- * counter rather than a per-call figure) and must not be trusted as "current context size".
+ * Multiplicative ratio beyond which a provider-reported context-token figure is treated as a
+ * reporting anomaly relative to its own session's real, independently-measured content
+ * (`sumMessageTokens` over the branch's messages) - even when the reported figure is
+ * comfortably under the model's context window (see `MIN_REPORTED_TOKENS_FOR_RATIO_CHECK`
+ * below for why the ratio alone is not sufficient). `estimateTokens`' chars/4 heuristic is
+ * documented as conservative (it overestimates real tokenizer counts), so ordinary drift runs
+ * the other way - measured content at or above the real reported figure, not far below it. A
+ * reported figure legitimately several times its own session's measured content essentially
+ * never happens in steady state. Both production incidents this guards against overstated the
+ * real content by close to an order of magnitude or more (819,151 vs ~85,600 measured, ~9.6x;
+ * 1,782,723 vs ~75,000 measured, ~23.8x - the latter already caught by the window check below,
+ * but both clear this ratio with room to spare), so 5x leaves a comfortable margin under either
+ * incident while staying well above the <1x drift a healthy session should show.
  */
-function isImplausibleContextTokens(tokens: number, contextWindow: number): boolean {
-	return contextWindow > 0 && tokens > contextWindow;
+const REPORTED_VS_MEASURED_IMPLAUSIBILITY_RATIO = 5;
+
+/**
+ * Floor on the reported figure itself (not the measured one) below which the ratio check above
+ * is skipped outright. `usage.totalTokens` reflects the full request sent to the provider -
+ * system prompt and tool definitions included - while `sumMessageTokens` only estimates the
+ * conversation's own messages; neither the system prompt nor tool definitions are part of the
+ * `messages` array this module measures. That fixed overhead is entirely legitimate and can
+ * dominate the ratio on an early, short session (a large tool corpus outweighing a two-message
+ * conversation), which is exactly the false-positive shape "ordinary, expected drift" has to
+ * survive. Gating on the reported figure's own absolute size bounds this: below the floor, even
+ * a wildly wrong ratio cannot meaningfully move `shouldCompact()` against a real model context
+ * window, so there is nothing worth flagging.
+ */
+const MIN_REPORTED_TOKENS_FOR_RATIO_CHECK = 50_000;
+
+/**
+ * A provider-reported context-token figure is untrustworthy in either of two ways: it can
+ * exceed the model's own context window outright (physically impossible - the API would have
+ * refused a request that large), or it can sit comfortably under the window yet still wildly
+ * overstate the session's real, independently-measured content (see
+ * `REPORTED_VS_MEASURED_IMPLAUSIBILITY_RATIO` above - observed in production as a
+ * `claude-code-cli` usage.totalTokens reading ~9.6x its session's real content while still
+ * comfortably under a 1,000,000-token window, so the window check alone let it through). The
+ * above-window check is a special case of the same underlying question - "is this figure
+ * consistent with what this session could actually contain" - rather than an independent guard,
+ * so both live in one function with one call site per caller.
+ */
+function isImplausibleContextTokens(reportedTokens: number, measuredTokens: number, contextWindow: number): boolean {
+	if (contextWindow <= 0) return false;
+	if (reportedTokens > contextWindow) return true;
+	return (
+		reportedTokens > MIN_REPORTED_TOKENS_FOR_RATIO_CHECK &&
+		reportedTokens > measuredTokens * REPORTED_VS_MEASURED_IMPLAUSIBILITY_RATIO
+	);
 }
 
 /**
@@ -169,11 +210,16 @@ function isImplausibleContextTokens(tokens: number, contextWindow: number): bool
  * kept separate from printing: callers that know their own UI context render this string
  * through `console.warn()` themselves, only when appropriate.
  */
-export function formatImplausibleContextTokensWarning(reportedTokens: number, contextWindow: number): string {
+export function formatImplausibleContextTokensWarning(
+	reportedTokens: number,
+	measuredTokens: number,
+	contextWindow: number,
+): string {
 	return chalk.yellow(
-		`Warning: provider-reported context usage (${reportedTokens.toLocaleString()} tokens) exceeds the ` +
-			`model's context window (${contextWindow.toLocaleString()} tokens) and was rejected as implausible; ` +
-			`using a message-size estimate instead.`,
+		`Warning: provider-reported context usage (${reportedTokens.toLocaleString()} tokens) is not plausible ` +
+			`for this session (real measured content: ${measuredTokens.toLocaleString()} tokens, model context ` +
+			`window: ${contextWindow.toLocaleString()} tokens) and was rejected as implausible; using the ` +
+			`message-size estimate instead.`,
 	);
 }
 
@@ -224,13 +270,17 @@ export function resolveReportedContextTokens(
 	messages: AgentMessage[],
 	contextWindow: number,
 ): { tokens: number; rejected: boolean; warning?: string } {
-	if (!isImplausibleContextTokens(reportedTokens, contextWindow)) {
+	if (contextWindow <= 0) {
+		return { tokens: reportedTokens, rejected: false };
+	}
+	const measuredTokens = sumMessageTokens(messages);
+	if (!isImplausibleContextTokens(reportedTokens, measuredTokens, contextWindow)) {
 		return { tokens: reportedTokens, rejected: false };
 	}
 	const warning = shouldAnnounceImplausibleContextTokens(contextWindow)
-		? formatImplausibleContextTokensWarning(reportedTokens, contextWindow)
+		? formatImplausibleContextTokensWarning(reportedTokens, measuredTokens, contextWindow)
 		: undefined;
-	return { tokens: sumMessageTokens(messages), rejected: true, warning };
+	return { tokens: measuredTokens, rejected: true, warning };
 }
 
 /**
@@ -271,7 +321,11 @@ export interface ContextUsageEstimate {
 	usageTokens: number;
 	trailingTokens: number;
 	lastUsageIndex: number | null;
-	/** True when the reported usage exceeded the model's context window and was rejected as implausible. */
+	/**
+	 * True when the reported usage was rejected as implausible - either it exceeded the model's
+	 * context window outright, or it deviated too far from the session's real, measured content
+	 * (see `isImplausibleContextTokens` in compaction.ts).
+	 */
 	usageRejected?: boolean;
 	/** One-shot anomaly message when `usageRejected` is true and this is the first such rejection for this context window - print through the caller's own UI-aware channel. */
 	warning?: string;
@@ -289,11 +343,12 @@ function getLastAssistantUsageInfo(messages: AgentMessage[]): { usage: Usage; in
  * Estimate context tokens from messages, using the last assistant usage when available.
  * If there are messages after the last usage, estimate their tokens with estimateTokens.
  *
- * @param contextWindow When provided, a reported usage figure exceeding this window is
- * rejected as a provider reporting anomaly rather than trusted as the real context size;
- * the estimate falls back to a message-size sum over every message instead. Omit when the
- * model's context window is not known to the caller (the reported figure is then trusted
- * as before - callers that know the window should always pass it).
+ * @param contextWindow When provided, a reported usage figure that exceeds this window, or
+ * that deviates too far from the session's own real, measured content, is rejected as a
+ * provider reporting anomaly rather than trusted as the real context size; the estimate falls
+ * back to a message-size sum over every message instead (see `isImplausibleContextTokens`).
+ * Omit when the model's context window is not known to the caller (the reported figure is
+ * then trusted as before - callers that know the window should always pass it).
  */
 export function estimateContextTokens(messages: AgentMessage[], contextWindow?: number): ContextUsageEstimate {
 	const usageInfo = getLastAssistantUsageInfo(messages);
@@ -310,16 +365,18 @@ export function estimateContextTokens(messages: AgentMessage[], contextWindow?: 
 
 	const reportedUsageTokens = calculateContextTokens(usageInfo.usage);
 
-	if (contextWindow !== undefined && isImplausibleContextTokens(reportedUsageTokens, contextWindow)) {
+	if (contextWindow !== undefined) {
 		const resolved = resolveReportedContextTokens(reportedUsageTokens, messages, contextWindow);
-		return {
-			tokens: resolved.tokens,
-			usageTokens: 0,
-			trailingTokens: resolved.tokens,
-			lastUsageIndex: usageInfo.index,
-			usageRejected: true,
-			warning: resolved.warning,
-		};
+		if (resolved.rejected) {
+			return {
+				tokens: resolved.tokens,
+				usageTokens: 0,
+				trailingTokens: resolved.tokens,
+				lastUsageIndex: usageInfo.index,
+				usageRejected: true,
+				warning: resolved.warning,
+			};
+		}
 	}
 
 	let trailingTokens = 0;
