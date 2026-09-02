@@ -795,9 +795,14 @@ describe("AgentSession compaction characterization", () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
 		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
+		// 120,000: above the default harness model's 128,000-token window minus the default
+		// 16,384-token reserve (111,616), so this still crosses the compaction threshold, but
+		// below the window itself, so the plausibility guard does not reject it as implausible
+		// and replace it with a tiny message-size estimate - this test is about the narrowing
+		// to the last successful usage on a later error, not about the plausibility guard.
 		const successfulAssistant = createAssistant(harness, {
 			stopReason: "stop",
-			totalTokens: 190_000,
+			totalTokens: 120_000,
 			timestamp: Date.now(),
 		});
 		const errorAssistant = createAssistant(harness, {
