@@ -3,16 +3,18 @@ import type { AssistantMessage, Usage } from "@earendil-works/pi-ai/compat";
 import { getModel } from "@earendil-works/pi-ai/compat";
 import { readFileSync } from "fs";
 import { join } from "path";
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	type CompactionSettings,
 	calculateContextTokens,
+	clearContextTokensWarningsForTests,
 	compact,
 	DEFAULT_COMPACTION_SETTINGS,
 	estimateContextTokens,
 	findCutPoint,
 	getLastAssistantUsage,
 	prepareCompaction,
+	resolveReportedContextTokens,
 	shouldCompact,
 } from "../src/core/compaction/index.ts";
 import {
@@ -268,6 +270,174 @@ describe("estimateContextTokens", () => {
 		expect(estimate.lastUsageIndex).toBe(1);
 		expect(estimate.trailingTokens).toBeGreaterThan(0);
 		expect(estimate.tokens).toBe(150 + estimate.trailingTokens);
+	});
+
+	// Reproduces the reported production incident: a `claude-code-cli` turn reported
+	// usage.totalTokens: 1,782,723 on a model with a 1,000,000-token context window
+	// (~78% over the window, ~24x the session's actual stored content), which drove a
+	// bogus auto-compaction. calculateContextTokens()/estimateContextTokens() must not
+	// trust a reported figure the model's own context window could never actually hold.
+	describe("plausibility guard against implausible reported usage", () => {
+		afterEach(() => {
+			clearContextTokensWarningsForTests();
+			vi.restoreAllMocks();
+		});
+
+		it("rejects a reported total far above the model's context window and falls back to a message-size estimate", () => {
+			const messages: AgentMessage[] = [
+				createUserMessage("Hello"),
+				createAssistantMessage("Hi", createMockUsage(1_700_000, 82_723)), // mirrors the reported 1,782,723
+			];
+
+			const estimate = estimateContextTokens(messages, 1_000_000);
+
+			expect(estimate.usageRejected).toBe(true);
+			expect(estimate.usageTokens).toBe(0);
+			expect(estimate.tokens).toBeGreaterThan(0);
+			expect(estimate.tokens).toBeLessThan(1_000_000);
+		});
+
+		it("still trusts a normal in-range reported total (no regression)", () => {
+			const messages: AgentMessage[] = [
+				createUserMessage("Hello"),
+				createAssistantMessage("Hi", createMockUsage(50_000, 10_000)),
+			];
+
+			const estimate = estimateContextTokens(messages, 1_000_000);
+
+			expect(estimate.usageRejected).toBeUndefined();
+			expect(estimate.usageTokens).toBe(60_000);
+			expect(estimate.tokens).toBe(60_000 + estimate.trailingTokens);
+		});
+
+		it("trusts the reported total as before when the caller does not know the context window", () => {
+			const messages: AgentMessage[] = [
+				createUserMessage("Hello"),
+				createAssistantMessage("Hi", createMockUsage(1_700_000, 82_723)),
+			];
+
+			const estimate = estimateContextTokens(messages);
+
+			expect(estimate.usageRejected).toBeUndefined();
+			expect(estimate.usageTokens).toBe(1_782_723);
+		});
+
+		it("surfaces the rejection once via a warning naming the rejected value and the context window", () => {
+			const messages: AgentMessage[] = [
+				createUserMessage("Hello"),
+				createAssistantMessage("Hi", createMockUsage(1_700_000, 82_723)),
+			];
+
+			const first = estimateContextTokens(messages, 1_000_000);
+			const second = estimateContextTokens(messages, 1_000_000);
+			const third = estimateContextTokens(messages, 1_000_000);
+
+			expect(first.warning).toBeDefined();
+			expect(first.warning).toContain("1,782,723");
+			expect(first.warning).toContain("1,000,000");
+			expect(second.warning).toBeUndefined();
+			expect(third.warning).toBeUndefined();
+		});
+
+		it("warns again for a different context window (not globally suppressed)", () => {
+			const messages: AgentMessage[] = [
+				createUserMessage("Hello"),
+				createAssistantMessage("Hi", createMockUsage(1_700_000, 82_723)),
+			];
+
+			const first = estimateContextTokens(messages, 1_000_000);
+			const second = estimateContextTokens(messages, 500_000);
+
+			expect(first.warning).toBeDefined();
+			expect(second.warning).toBeDefined();
+		});
+	});
+});
+
+describe("resolveReportedContextTokens", () => {
+	afterEach(() => {
+		clearContextTokensWarningsForTests();
+		vi.restoreAllMocks();
+	});
+
+	// Vets the exact figure the caller holds, rather than re-deriving one from the message
+	// array: the message a caller's figure came from (an aborted or errored turn) is one
+	// estimateContextTokens' own last-valid-usage lookup skips.
+	it("rejects a figure above the context window and returns a message-size estimate instead", () => {
+		const messages: AgentMessage[] = [
+			createUserMessage("Hello"),
+			createAssistantMessage("Hi", createMockUsage(1_700_000, 82_723)),
+		];
+
+		const resolved = resolveReportedContextTokens(1_782_723, messages, 1_000_000);
+
+		expect(resolved.rejected).toBe(true);
+		expect(resolved.tokens).toBeGreaterThan(0);
+		expect(resolved.tokens).toBeLessThan(1_000_000);
+	});
+
+	it("returns an in-range figure untouched", () => {
+		const messages: AgentMessage[] = [createUserMessage("Hello")];
+
+		const resolved = resolveReportedContextTokens(600_000, messages, 1_000_000);
+
+		expect(resolved).toEqual({ tokens: 600_000, rejected: false });
+	});
+
+	it("returns the figure untouched when the context window is unknown", () => {
+		const messages: AgentMessage[] = [createUserMessage("Hello")];
+
+		const resolved = resolveReportedContextTokens(1_782_723, messages, 0);
+
+		expect(resolved).toEqual({ tokens: 1_782_723, rejected: false });
+	});
+
+	it("shares the one-shot per-window warning with estimateContextTokens", () => {
+		const messages: AgentMessage[] = [
+			createUserMessage("Hello"),
+			createAssistantMessage("Hi", createMockUsage(1_700_000, 82_723)),
+		];
+
+		const resolved = resolveReportedContextTokens(1_782_723, messages, 1_000_000);
+		const estimate = estimateContextTokens(messages, 1_000_000);
+
+		expect(resolved.warning).toBeDefined();
+		expect(resolved.warning).toContain("1,782,723");
+		expect(estimate.warning).toBeUndefined();
+	});
+});
+
+describe("prepareCompaction with a context window", () => {
+	// Small keepRecentTokens forces a real cut point so there is content to summarize -
+	// matches the convention in "should re-summarize previously kept messages..." above.
+	const forceCutSettings: CompactionSettings = { ...DEFAULT_COMPACTION_SETTINGS, keepRecentTokens: 10 };
+
+	it("rejects an implausible tokensBefore and falls back to a message-size estimate", () => {
+		const u1 = createMessageEntry(createUserMessage("hello ".repeat(20)));
+		const a1 = createMessageEntry(
+			createAssistantMessage("hi ".repeat(20), createMockUsage(1_700_000, 82_723)), // mirrors the reported 1,782,723
+		);
+		const u2 = createMessageEntry(createUserMessage("more context ".repeat(20)));
+		const a2 = createMessageEntry(createAssistantMessage("ok ".repeat(20)));
+
+		const preparation = prepareCompaction([u1, a1, u2, a2], forceCutSettings, 1_000_000);
+
+		expect(preparation).toBeDefined();
+		expect(preparation!.tokensBefore).toBeGreaterThan(0);
+		expect(preparation!.tokensBefore).toBeLessThan(1_000_000);
+	});
+
+	it("still uses the reported tokensBefore when it is plausible (no regression)", () => {
+		const u1 = createMessageEntry(createUserMessage("hello ".repeat(20)));
+		const a1 = createMessageEntry(createAssistantMessage("hi ".repeat(20), createMockUsage(50_000, 10_000)));
+		const u2 = createMessageEntry(createUserMessage("more context ".repeat(20)));
+		const a2 = createMessageEntry(createAssistantMessage("ok ".repeat(20)));
+
+		const withoutWindow = prepareCompaction([u1, a1, u2, a2], forceCutSettings);
+		const withWindow = prepareCompaction([u1, a1, u2, a2], forceCutSettings, 1_000_000);
+
+		expect(withWindow).toBeDefined();
+		expect(withWindow!.tokensBefore).toBe(withoutWindow!.tokensBefore);
 	});
 });
 

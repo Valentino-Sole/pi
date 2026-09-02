@@ -9,6 +9,7 @@ import type { AgentMessage, StreamFn, ThinkingLevel } from "@earendil-works/pi-a
 import { contentText, type RetryCallbacks, type RetryPolicy, retryAssistantCall, uuidv7 } from "@earendil-works/pi-ai";
 import type { AssistantMessage, Context, Model, SimpleStreamOptions, Usage } from "@earendil-works/pi-ai/compat";
 import { completeSimple } from "@earendil-works/pi-ai/compat";
+import chalk from "chalk";
 import { convertToLlm } from "../messages.ts";
 import {
 	buildSessionContext,
@@ -147,6 +148,91 @@ export function calculateContextTokens(usage: Usage): number {
 	return usage.totalTokens || usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
 }
 
+const warnedContextWindows = new Set<number>();
+
+/**
+ * A provider-reported context-token figure can never legitimately exceed the model's own
+ * context window - the API would refuse a request that large outright. When it does, the
+ * report itself is the anomaly (observed in production as a `claude-code-cli` usage.totalTokens
+ * reading ~78% over the model's 1M window, in the same order of magnitude as an accumulating
+ * counter rather than a per-call figure) and must not be trusted as "current context size".
+ */
+function isImplausibleContextTokens(tokens: number, contextWindow: number): boolean {
+	return contextWindow > 0 && tokens > contextWindow;
+}
+
+/**
+ * Format the one-shot implausible-context-tokens warning message. This module has no notion
+ * of whether a live UI currently owns the terminal (a raw stdout write would corrupt a TUI's
+ * managed alternate-screen render - see `ExtensionRunner.hasUI()` and its existing gated
+ * `console.warn` at extensions/runner.ts:551 for the established precedent), so formatting is
+ * kept separate from printing: callers that know their own UI context render this string
+ * through `console.warn()` themselves, only when appropriate.
+ */
+export function formatImplausibleContextTokensWarning(reportedTokens: number, contextWindow: number): string {
+	return chalk.yellow(
+		`Warning: provider-reported context usage (${reportedTokens.toLocaleString()} tokens) exceeds the ` +
+			`model's context window (${contextWindow.toLocaleString()} tokens) and was rejected as implausible; ` +
+			`using a message-size estimate instead.`,
+	);
+}
+
+/**
+ * One-shot gate for surfacing a rejected provider usage figure, per distinct context window
+ * per process, mirroring the dedup pattern used for deprecation warnings (see
+ * utils/deprecation.ts). A still-affected provider stream tends to keep reporting anomalous
+ * readings on every subsequent turn (per the production incident this guards against), so
+ * deduping per-window rather than per-exact-value avoids re-warning every turn while still
+ * surfacing the anomaly. Consuming the gate (returning true) does not depend on whether the
+ * caller actually goes on to print anything.
+ */
+function shouldAnnounceImplausibleContextTokens(contextWindow: number): boolean {
+	if (warnedContextWindows.has(contextWindow)) return false;
+	warnedContextWindows.add(contextWindow);
+	return true;
+}
+
+/** Clear one-shot implausible-context-tokens warning state. Exported for tests. */
+export function clearContextTokensWarningsForTests(): void {
+	warnedContextWindows.clear();
+}
+
+function sumMessageTokens(messages: AgentMessage[]): number {
+	let estimated = 0;
+	for (const message of messages) {
+		estimated += estimateTokens(message);
+	}
+	return estimated;
+}
+
+/**
+ * Vet a single provider-reported context-token figure against the model's context window.
+ *
+ * Callers that already hold the exact reported figure they intend to act on must use this
+ * rather than re-deriving one through {@link estimateContextTokens}: that function picks the
+ * *last valid* usage in the array and deliberately skips aborted and errored messages, so it
+ * can end up judging the plausibility of a different message than the one the caller's figure
+ * came from - or of no message at all.
+ *
+ * @returns The reported figure when it is plausible, or a message-size sum over `messages`
+ * when it is not. `warning` carries the one-shot anomaly message (only on the first rejection
+ * for this context window) for the caller to print through its own UI-aware channel - this
+ * function never writes to the console itself.
+ */
+export function resolveReportedContextTokens(
+	reportedTokens: number,
+	messages: AgentMessage[],
+	contextWindow: number,
+): { tokens: number; rejected: boolean; warning?: string } {
+	if (!isImplausibleContextTokens(reportedTokens, contextWindow)) {
+		return { tokens: reportedTokens, rejected: false };
+	}
+	const warning = shouldAnnounceImplausibleContextTokens(contextWindow)
+		? formatImplausibleContextTokensWarning(reportedTokens, contextWindow)
+		: undefined;
+	return { tokens: sumMessageTokens(messages), rejected: true, warning };
+}
+
 /**
  * Get usage from an assistant message if available.
  * Skips aborted, error, and all-zero usage messages as they don't have valid usage data.
@@ -185,6 +271,10 @@ export interface ContextUsageEstimate {
 	usageTokens: number;
 	trailingTokens: number;
 	lastUsageIndex: number | null;
+	/** True when the reported usage exceeded the model's context window and was rejected as implausible. */
+	usageRejected?: boolean;
+	/** One-shot anomaly message when `usageRejected` is true and this is the first such rejection for this context window - print through the caller's own UI-aware channel. */
+	warning?: string;
 }
 
 function getLastAssistantUsageInfo(messages: AgentMessage[]): { usage: Usage; index: number } | undefined {
@@ -198,15 +288,18 @@ function getLastAssistantUsageInfo(messages: AgentMessage[]): { usage: Usage; in
 /**
  * Estimate context tokens from messages, using the last assistant usage when available.
  * If there are messages after the last usage, estimate their tokens with estimateTokens.
+ *
+ * @param contextWindow When provided, a reported usage figure exceeding this window is
+ * rejected as a provider reporting anomaly rather than trusted as the real context size;
+ * the estimate falls back to a message-size sum over every message instead. Omit when the
+ * model's context window is not known to the caller (the reported figure is then trusted
+ * as before - callers that know the window should always pass it).
  */
-export function estimateContextTokens(messages: AgentMessage[]): ContextUsageEstimate {
+export function estimateContextTokens(messages: AgentMessage[], contextWindow?: number): ContextUsageEstimate {
 	const usageInfo = getLastAssistantUsageInfo(messages);
 
 	if (!usageInfo) {
-		let estimated = 0;
-		for (const message of messages) {
-			estimated += estimateTokens(message);
-		}
+		const estimated = sumMessageTokens(messages);
 		return {
 			tokens: estimated,
 			usageTokens: 0,
@@ -215,15 +308,28 @@ export function estimateContextTokens(messages: AgentMessage[]): ContextUsageEst
 		};
 	}
 
-	const usageTokens = calculateContextTokens(usageInfo.usage);
+	const reportedUsageTokens = calculateContextTokens(usageInfo.usage);
+
+	if (contextWindow !== undefined && isImplausibleContextTokens(reportedUsageTokens, contextWindow)) {
+		const resolved = resolveReportedContextTokens(reportedUsageTokens, messages, contextWindow);
+		return {
+			tokens: resolved.tokens,
+			usageTokens: 0,
+			trailingTokens: resolved.tokens,
+			lastUsageIndex: usageInfo.index,
+			usageRejected: true,
+			warning: resolved.warning,
+		};
+	}
+
 	let trailingTokens = 0;
 	for (let i = usageInfo.index + 1; i < messages.length; i++) {
 		trailingTokens += estimateTokens(messages[i]);
 	}
 
 	return {
-		tokens: usageTokens + trailingTokens,
-		usageTokens,
+		tokens: reportedUsageTokens + trailingTokens,
+		usageTokens: reportedUsageTokens,
 		trailingTokens,
 		lastUsageIndex: usageInfo.index,
 	};
@@ -739,6 +845,8 @@ export interface CompactionPreparation {
 	/** Whether this is a split turn (cut point in middle of turn) */
 	isSplitTurn: boolean;
 	tokensBefore: number;
+	/** One-shot anomaly message when the reported tokensBefore figure was rejected as implausible and this is the first such rejection for this context window - print through the caller's own UI-aware channel. */
+	tokensBeforeWarning?: string;
 	/** Summary from previous compaction, for iterative update */
 	previousSummary?: string;
 	/** File operations extracted from messagesToSummarize */
@@ -750,6 +858,7 @@ export interface CompactionPreparation {
 export function prepareCompaction(
 	pathEntries: SessionEntry[],
 	settings: CompactionSettings,
+	contextWindow?: number,
 ): CompactionPreparation | undefined {
 	if (pathEntries.length > 0 && pathEntries[pathEntries.length - 1].type === "compaction") {
 		return undefined;
@@ -773,7 +882,9 @@ export function prepareCompaction(
 	}
 	const boundaryEnd = pathEntries.length;
 
-	const tokensBefore = estimateContextTokens(buildSessionContext(pathEntries).messages).tokens;
+	const tokensBeforeEstimate = estimateContextTokens(buildSessionContext(pathEntries).messages, contextWindow);
+	const tokensBefore = tokensBeforeEstimate.tokens;
+	const tokensBeforeWarning = tokensBeforeEstimate.warning;
 
 	const cutPoint = findCutPoint(pathEntries, boundaryStart, boundaryEnd, settings.keepRecentTokens);
 
@@ -822,6 +933,7 @@ export function prepareCompaction(
 		turnPrefixMessages,
 		isSplitTurn: cutPoint.isSplitTurn,
 		tokensBefore,
+		tokensBeforeWarning,
 		previousSummary,
 		fileOps,
 		settings,
