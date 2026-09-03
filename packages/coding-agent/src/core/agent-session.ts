@@ -2197,6 +2197,7 @@ export class AgentSession {
 				this.agent.state.messages,
 				assistantMessage,
 				contextWindow,
+				compactionEntry ? new Date(compactionEntry.timestamp).getTime() : undefined,
 			);
 			this._reportImplausibleContextWarning(overflowPlausibility.warning);
 			contextOverflow = overflowPlausibility.plausible;

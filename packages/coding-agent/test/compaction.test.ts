@@ -639,6 +639,40 @@ describe("resolveOverflowPlausibility", () => {
 		expect(resolved).toEqual({ plausible: true });
 	});
 
+	// A compaction carries its kept messages over verbatim, so the newest kept assistant still
+	// reports the pre-compaction context size while the surviving content measures a fraction of
+	// it. Same inputs as the tool-heavy trust case above, plus a compaction boundary: the stale
+	// 980,500 is discarded and the measured sum alone decides.
+	it("ignores a prior reading recorded at or before the compaction boundary", () => {
+		const boundary = Date.now();
+		const judged = { ...createAssistantMessage("over", createMockUsage(1_050_000, 10)), timestamp: boundary + 1_000 };
+		const messages: AgentMessage[] = [
+			createUserMessage("x".repeat(800_000)), // measures to 200,000
+			{ ...createAssistantMessage("ok", createMockUsage(980_500, 0)), timestamp: boundary },
+			judged,
+		];
+
+		const resolved = resolveOverflowPlausibility(1_050_000, messages, judged, 1_000_000, boundary);
+
+		expect(resolved.plausible).toBe(false);
+		expect(resolved.warning).toContain("1,050,000");
+		expect(resolved.warning).toContain("200,0");
+	});
+
+	it("keeps using a prior reading recorded after the compaction boundary", () => {
+		const boundary = Date.now();
+		const judged = { ...createAssistantMessage("over", createMockUsage(1_050_000, 10)), timestamp: boundary + 2_000 };
+		const messages: AgentMessage[] = [
+			createUserMessage("x".repeat(800_000)), // measures to 200,000
+			{ ...createAssistantMessage("ok", createMockUsage(980_500, 0)), timestamp: boundary + 1_000 },
+			judged,
+		];
+
+		const resolved = resolveOverflowPlausibility(1_050_000, messages, judged, 1_000_000, boundary);
+
+		expect(resolved).toEqual({ plausible: true });
+	});
+
 	it("shares the one-shot per-window warning gate with resolveReportedContextTokens", () => {
 		const judged = createAssistantMessage("over", createMockUsage(1_782_723, 10));
 		const messages: AgentMessage[] = [

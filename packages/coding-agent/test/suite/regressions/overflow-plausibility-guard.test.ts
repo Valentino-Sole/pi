@@ -166,6 +166,63 @@ describe("isContextOverflow's silent-overflow signal rejects an implausible repo
 		expect(runAutoCompactionSpy).not.toHaveBeenCalledWith("overflow", expect.anything());
 	});
 
+	// A compaction keeps its most recent messages verbatim, usage field included, so the newest
+	// kept assistant still reports the old pre-compaction context size while the surviving
+	// message content is a fraction of it. Trusting that stale figure as the baseline would wave
+	// through a corrupt reading and force-compact a session that just finished compacting. Same
+	// numbers as the no-regression case above, with only a compaction boundary added in between.
+	it("does not auto-compact when the only prior reading predates the latest compaction", async () => {
+		const harness = await createGuardHarness();
+		harnesses.push(harness);
+		const stalePrior: AssistantMessage = {
+			...overflowAssistantMessage(harness, usageOf(980_500), "stop"),
+			timestamp: Date.now() - 60_000,
+		};
+		harness.sessionManager.appendCompaction("summary of the dropped turns", "first-kept-entry", 980_500);
+		const reading = {
+			...overflowAssistantMessage(harness, usageOf(1_050_000), "stop"),
+			timestamp: Date.now() + 60_000,
+		};
+		harness.session.agent.state.messages = [
+			{ role: "user", content: [{ type: "text", text: "x".repeat(800_000) }], timestamp: Date.now() - 60_001 }, // measures to 200,000
+			stalePrior,
+			reading,
+		];
+		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
+		const runAutoCompactionSpy = vi.spyOn(sessionInternals, "_runAutoCompaction").mockResolvedValue(false);
+
+		await sessionInternals._checkCompaction(reading);
+
+		expect(runAutoCompactionSpy).not.toHaveBeenCalledWith("overflow", expect.anything());
+	});
+
+	// The cutoff must exclude only stale readings: a prior turn recorded after the compaction
+	// describes the current context and remains a valid baseline.
+	it("still auto-compacts when the prior reading comes after the latest compaction", async () => {
+		const harness = await createGuardHarness();
+		harnesses.push(harness);
+		harness.sessionManager.appendCompaction("summary of the dropped turns", "first-kept-entry", 980_500);
+		const freshPrior: AssistantMessage = {
+			...overflowAssistantMessage(harness, usageOf(980_500), "stop"),
+			timestamp: Date.now() + 30_000,
+		};
+		const reading = {
+			...overflowAssistantMessage(harness, usageOf(1_050_000), "stop"),
+			timestamp: Date.now() + 60_000,
+		};
+		harness.session.agent.state.messages = [
+			{ role: "user", content: [{ type: "text", text: "x".repeat(800_000) }], timestamp: Date.now() + 29_000 }, // measures to 200,000
+			freshPrior,
+			reading,
+		];
+		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
+		const runAutoCompactionSpy = vi.spyOn(sessionInternals, "_runAutoCompaction").mockResolvedValue(false);
+
+		await sessionInternals._checkCompaction(reading);
+
+		expect(runAutoCompactionSpy).toHaveBeenCalledWith("overflow", false);
+	});
+
 	// Case 1 (a provider explicitly erroring "prompt is too long") is the provider's own
 	// authoritative refusal, not a locally-computed figure - it must be trusted unconditionally,
 	// even when the usage numbers attached to the same message look implausible.

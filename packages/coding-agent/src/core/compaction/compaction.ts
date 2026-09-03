@@ -319,13 +319,32 @@ function formatImplausibleOverflowWarning(
  * Find the session's own last valid reported context size *before* `judgedMessage`, so the
  * message under judgement cannot serve as its own baseline. Uses the same last-valid-usage walk
  * (and the same aborted/errored/all-zero skipping) `getLastAssistantUsageInfo` performs.
+ *
+ * `compactionBoundaryTimestamp` (epoch ms of the latest compaction entry, when the session has
+ * one) excludes candidates from before that boundary, mirroring the identical stale-usage check
+ * the threshold-compaction path already performs. A compaction keeps its most recent messages
+ * verbatim - usage field included - while dropping everything it summarized, so a kept assistant
+ * still reports the old, far larger context. Left in play it would hand this guard an inflated
+ * baseline that waves through exactly the corrupted readings the guard exists to reject.
  */
-function findPriorReportedContextTokens(messages: AgentMessage[], judgedMessage: AgentMessage): number | undefined {
+function findPriorReportedContextTokens(
+	messages: AgentMessage[],
+	judgedMessage: AgentMessage,
+	compactionBoundaryTimestamp?: number,
+): number | undefined {
 	const judgedIndex = messages.lastIndexOf(judgedMessage);
 	const start = judgedIndex >= 0 ? judgedIndex - 1 : messages.length - 1;
 	for (let i = start; i >= 0; i--) {
-		const usage = getAssistantUsage(messages[i]);
-		if (usage) return calculateContextTokens(usage);
+		const message = messages[i];
+		const usage = getAssistantUsage(message);
+		if (!usage) continue;
+		if (
+			compactionBoundaryTimestamp !== undefined &&
+			(message as AssistantMessage).timestamp <= compactionBoundaryTimestamp
+		) {
+			return undefined;
+		}
+		return calculateContextTokens(usage);
 	}
 	return undefined;
 }
@@ -351,15 +370,20 @@ function findPriorReportedContextTokens(messages: AgentMessage[], judgedMessage:
  * in an anomalous reporting mode keeps overstating on every turn, so an unvetted predecessor
  * would let the second such reading validate itself against the first and defeat the guard from
  * then on. The predecessor therefore faces the same ratio test against `sumMessageTokens` before
- * it is trusted - the current message-size sum is an upper bound on the smaller content that
- * existed at that earlier turn, so no historical snapshot is needed - and a predecessor that
- * fails it is discarded in favour of the measured sum alone. A credible one is combined with the
- * measured sum via `max`, so a genuinely large, self-consistent history still gets the higher and
- * more accurate baseline.
+ * it is trusted - since `compactionBoundaryTimestamp` confines candidates to the current
+ * post-compaction segment, which only ever grows, the current message-size sum is an upper bound
+ * on the smaller content that existed at that earlier turn and no historical snapshot is needed -
+ * and a predecessor that fails it is discarded in favour of the measured sum alone. A credible
+ * one is combined with the measured sum via `max`, so a genuinely large, self-consistent history
+ * still gets the higher and more accurate baseline.
  *
- * With no prior valid usage to compare against - a session's first turn - the reading is trusted,
- * matching the no-baseline-available behavior of {@link resolveReportedContextTokens} for an
- * unknown context window.
+ * The two ways that leaves no prior reading are not equivalent. On a session's very first turn
+ * `messages` holds little more than the user's prompt, so it measures almost nothing about the
+ * request the provider actually sized and cannot serve as a baseline at all - the reading is
+ * trusted, matching the no-baseline-available behavior of {@link resolveReportedContextTokens}
+ * for an unknown context window. On the first turn after a compaction the array instead holds a
+ * complete picture of the current context content (the summary plus the kept tail), so the
+ * measured sum stands alone as the baseline, the same fallback an untrustworthy predecessor gets.
  *
  * @returns `plausible: false` when the reported figure should be rejected as an overflow signal
  * (the caller should not treat this as a real overflow). `warning` carries the one-shot anomaly
@@ -371,18 +395,20 @@ export function resolveOverflowPlausibility(
 	messages: AgentMessage[],
 	judgedMessage: AgentMessage,
 	contextWindow: number,
+	compactionBoundaryTimestamp?: number,
 ): { plausible: boolean; warning?: string } {
 	if (contextWindow <= 0) {
 		return { plausible: true };
 	}
-	const priorReportedTokens = findPriorReportedContextTokens(messages, judgedMessage);
-	if (priorReportedTokens === undefined) {
+	const priorReportedTokens = findPriorReportedContextTokens(messages, judgedMessage, compactionBoundaryTimestamp);
+	if (priorReportedTokens === undefined && compactionBoundaryTimestamp === undefined) {
 		return { plausible: true };
 	}
 	const measuredTokens = sumMessageTokens(messages);
-	const baselineTokens = exceedsPlausibleRatio(priorReportedTokens, measuredTokens)
-		? measuredTokens
-		: Math.max(priorReportedTokens, measuredTokens);
+	const baselineTokens =
+		priorReportedTokens === undefined || exceedsPlausibleRatio(priorReportedTokens, measuredTokens)
+			? measuredTokens
+			: Math.max(priorReportedTokens, measuredTokens);
 	if (!exceedsPlausibleRatio(reportedTokens, baselineTokens)) {
 		return { plausible: true };
 	}
