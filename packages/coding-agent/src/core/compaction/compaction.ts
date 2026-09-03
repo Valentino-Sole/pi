@@ -284,6 +284,47 @@ export function resolveReportedContextTokens(
 }
 
 /**
+ * Vet a provider-reported *overflow* signal - `isContextOverflow`'s z.ai-style silent-overflow
+ * case (a successful response whose usage.input + usage.cacheRead exceeds contextWindow) or its
+ * Xiaomi MiMo-style length-stop case (the same figure filling contextWindow with zero output) -
+ * against the session's real, measured content.
+ *
+ * Unlike {@link resolveReportedContextTokens}, the reported figure sitting at or above
+ * `contextWindow` is not itself evidence of anomaly here: that is exactly the condition both
+ * overflow cases are built to detect (a provider that accepts, or truncates to fit, a request
+ * larger than its documented window - see overflow.ts). Only the same reported-vs-measured ratio
+ * comparison `isImplausibleContextTokens` uses applies, so a corrupted or inflated usage.input
+ * reading (the same failure mode Case 3's guard above defends against) cannot misfire an
+ * unnecessary compact-and-retry through the overflow path just because it happens to clear
+ * contextWindow too.
+ *
+ * @returns `plausible: false` when the reported figure should be rejected as an overflow signal
+ * (the caller should not treat this as a real overflow). `warning` carries the one-shot anomaly
+ * message (see `shouldAnnounceImplausibleContextTokens`) for the caller to print through its own
+ * UI-aware channel when the reading is rejected.
+ */
+export function resolveOverflowPlausibility(
+	reportedTokens: number,
+	messages: AgentMessage[],
+	contextWindow: number,
+): { plausible: boolean; warning?: string } {
+	if (contextWindow <= 0) {
+		return { plausible: true };
+	}
+	const measuredTokens = sumMessageTokens(messages);
+	const implausible =
+		reportedTokens > MIN_REPORTED_TOKENS_FOR_RATIO_CHECK &&
+		reportedTokens > measuredTokens * REPORTED_VS_MEASURED_IMPLAUSIBILITY_RATIO;
+	if (!implausible) {
+		return { plausible: true };
+	}
+	const warning = shouldAnnounceImplausibleContextTokens(contextWindow)
+		? formatImplausibleContextTokensWarning(reportedTokens, measuredTokens, contextWindow)
+		: undefined;
+	return { plausible: false, warning };
+}
+
+/**
  * Get usage from an assistant message if available.
  * Skips aborted, error, and all-zero usage messages as they don't have valid usage data.
  */

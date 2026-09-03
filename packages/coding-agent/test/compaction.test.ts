@@ -14,6 +14,7 @@ import {
 	findCutPoint,
 	getLastAssistantUsage,
 	prepareCompaction,
+	resolveOverflowPlausibility,
 	resolveReportedContextTokens,
 	shouldCompact,
 } from "../src/core/compaction/index.ts";
@@ -514,6 +515,66 @@ describe("resolveReportedContextTokens", () => {
 		const resolved = resolveReportedContextTokens(150_000, messages, 1_000_000); // ratio ~3x
 
 		expect(resolved).toEqual({ tokens: 150_000, rejected: false });
+	});
+});
+
+describe("resolveOverflowPlausibility", () => {
+	afterEach(() => {
+		clearContextTokensWarningsForTests();
+		vi.restoreAllMocks();
+	});
+
+	// Unlike resolveReportedContextTokens, a reported figure at or above the context window is
+	// not itself evidence of anomaly: that is exactly the z.ai-style silent-overflow signal this
+	// function is meant to let through.
+	it("trusts a genuine overflow whose reported figure matches the real measured content", () => {
+		const messages: AgentMessage[] = [createUserMessage("x".repeat(4_000_000))]; // measures to 1,000,000
+
+		const resolved = resolveOverflowPlausibility(1_050_000, messages, 1_000_000);
+
+		expect(resolved).toEqual({ plausible: true });
+	});
+
+	// Mirrors the production incident pattern (a reported figure far above the session's real
+	// measured content) but applied to the overflow path: same corrupted usage.input reading,
+	// this time exceeding contextWindow itself rather than merely sitting well under it.
+	it("rejects a reported figure far above the real measured content", () => {
+		const messages: AgentMessage[] = [createUserMessage("x".repeat(342_400))]; // measures to 85,600
+
+		const resolved = resolveOverflowPlausibility(1_050_000, messages, 1_000_000);
+
+		expect(resolved.plausible).toBe(false);
+		expect(resolved.warning).toContain("1,050,000");
+		expect(resolved.warning).toContain("85,600");
+	});
+
+	it("returns the figure untouched when the context window is unknown", () => {
+		const messages: AgentMessage[] = [createUserMessage("Hello")];
+
+		const resolved = resolveOverflowPlausibility(1_050_000, messages, 0);
+
+		expect(resolved).toEqual({ plausible: true });
+	});
+
+	it("stays below the ratio check's absolute floor even for a small window", () => {
+		// Kept below MIN_REPORTED_TOKENS_FOR_RATIO_CHECK so the ratio dimension never applies,
+		// matching resolveReportedContextTokens's own floor rationale (fixed system-prompt/tool
+		// overhead outweighing a tiny conversation on an early, short session).
+		const messages: AgentMessage[] = [createUserMessage("Hello")];
+
+		const resolved = resolveOverflowPlausibility(40_000, messages, 30_000);
+
+		expect(resolved).toEqual({ plausible: true });
+	});
+
+	it("shares the one-shot per-window warning gate with resolveReportedContextTokens", () => {
+		const messages: AgentMessage[] = [createUserMessage("x".repeat(342_400))]; // measures to 85,600
+
+		const first = resolveOverflowPlausibility(1_050_000, messages, 1_000_000);
+		const second = resolveReportedContextTokens(1_050_000, messages, 1_000_000);
+
+		expect(first.warning).toBeDefined();
+		expect(second.warning).toBeUndefined();
 	});
 });
 

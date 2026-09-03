@@ -63,6 +63,7 @@ import {
 	estimateTokens,
 	generateBranchSummary,
 	prepareCompaction,
+	resolveOverflowPlausibility,
 	resolveReportedContextTokens,
 	shouldCompact,
 } from "./compaction/index.ts";
@@ -2175,7 +2176,27 @@ export class AgentSession {
 		// Automatic cases 1 and 2: context overflow.
 		// A length stop is recoverable when output ended below the model's original desired limit,
 		// independent of the configured context size or any context-clamped provider request limit.
-		const contextOverflow = sameModel && isContextOverflow(assistantMessage, contextWindow);
+		const rawContextOverflow = sameModel && isContextOverflow(assistantMessage, contextWindow);
+		// isContextOverflow's error-message case (stopReason "error") is the provider's own
+		// authoritative refusal of the request and is trusted outright. Its other two cases
+		// (z.ai-style silent overflow on a successful response, Xiaomi MiMo-style length-stop)
+		// both judge the same locally-reported usage.input + usage.cacheRead figure Case 3's
+		// guard below exists to distrust (see resolveOverflowPlausibility / the production
+		// incidents documented on isImplausibleContextTokens in compaction.ts) - a corrupted or
+		// inflated reading here would misfire "silent overflow" and force an unnecessary
+		// compact-and-retry through this path even though Case 3 would reject the very same
+		// number. Vet it the same way before trusting it.
+		let contextOverflow = rawContextOverflow;
+		if (rawContextOverflow && assistantMessage.stopReason !== "error") {
+			const reportedOverflowTokens = assistantMessage.usage.input + assistantMessage.usage.cacheRead;
+			const overflowPlausibility = resolveOverflowPlausibility(
+				reportedOverflowTokens,
+				this.agent.state.messages,
+				contextWindow,
+			);
+			this._reportImplausibleContextWarning(overflowPlausibility.warning);
+			contextOverflow = overflowPlausibility.plausible;
+		}
 		const recoverableLength = sameModel && isRecoverableLength(assistantMessage, this.model?.maxTokens ?? 0);
 		if (contextOverflow || recoverableLength) {
 			const willRetry = assistantMessage.stopReason !== "stop";
