@@ -524,34 +524,81 @@ describe("resolveOverflowPlausibility", () => {
 		vi.restoreAllMocks();
 	});
 
-	// Unlike resolveReportedContextTokens, a reported figure at or above the context window is
-	// not itself evidence of anomaly: that is exactly the z.ai-style silent-overflow signal this
-	// function is meant to let through.
-	it("trusts a genuine overflow whose reported figure matches the real measured content", () => {
-		const messages: AgentMessage[] = [createUserMessage("x".repeat(4_000_000))]; // measures to 1,000,000
+	// The reported figure is held up against the session's own previous reported usage rather
+	// than a message-size sum. In the overflow regime the system prompt and tool definitions -
+	// which sumMessageTokens cannot see at all - are exactly what makes a reported figure exceed
+	// the measured conversation, so a message-size baseline would reject genuine overflows on
+	// tool-heavy sessions. Here the conversation measures ~25,000 tokens while the session is
+	// legitimately reporting ~120,000.
+	it("trusts a genuine overflow on a tool-heavy session whose messages measure far below the reported figure", () => {
+		const judged = createAssistantMessage("over", createMockUsage(130_000, 10));
+		const messages: AgentMessage[] = [
+			createUserMessage("x".repeat(100_000)), // measures to 25,000
+			createAssistantMessage("ok", createMockUsage(120_000, 200)), // previous reported usage: 120,200
+			judged,
+		];
 
-		const resolved = resolveOverflowPlausibility(1_050_000, messages, 1_000_000);
+		const resolved = resolveOverflowPlausibility(130_000, messages, judged, 128_000);
 
 		expect(resolved).toEqual({ plausible: true });
 	});
 
-	// Mirrors the production incident pattern (a reported figure far above the session's real
-	// measured content) but applied to the overflow path: same corrupted usage.input reading,
-	// this time exceeding contextWindow itself rather than merely sitting well under it.
-	it("rejects a reported figure far above the real measured content", () => {
-		const messages: AgentMessage[] = [createUserMessage("x".repeat(342_400))]; // measures to 85,600
+	// Unlike resolveReportedContextTokens, a reported figure at or above the context window is
+	// not itself evidence of anomaly: that is exactly the z.ai-style silent-overflow signal this
+	// function is meant to let through.
+	it("trusts an overflow reading that stays within a plausible multiple of the previous reported usage", () => {
+		const judged = createAssistantMessage("over", createMockUsage(1_050_000, 10));
+		const messages: AgentMessage[] = [
+			createUserMessage("hi"),
+			createAssistantMessage("ok", createMockUsage(980_000, 500)), // previous reported usage: 980,500
+			judged,
+		];
 
-		const resolved = resolveOverflowPlausibility(1_050_000, messages, 1_000_000);
+		const resolved = resolveOverflowPlausibility(1_050_000, messages, judged, 1_000_000);
+
+		expect(resolved).toEqual({ plausible: true });
+	});
+
+	// Mirrors the production incident pattern (a reported figure far beyond anything this
+	// session has reported before) applied to the overflow path. Also pins that the judged
+	// message cannot serve as its own baseline: it reports the very same figure, so using it
+	// would make every reading trivially plausible.
+	it("rejects an overflow reading that jumps far beyond the session's previous reported usage", () => {
+		const judged = createAssistantMessage("over", createMockUsage(1_782_723, 10));
+		const messages: AgentMessage[] = [
+			createUserMessage("hi"),
+			createAssistantMessage("ok", createMockUsage(85_000, 600)), // previous reported usage: 85,600
+			judged,
+		];
+
+		const resolved = resolveOverflowPlausibility(1_782_723, messages, judged, 1_000_000);
 
 		expect(resolved.plausible).toBe(false);
-		expect(resolved.warning).toContain("1,050,000");
+		expect(resolved.warning).toContain("1,782,723");
 		expect(resolved.warning).toContain("85,600");
+		expect(resolved.warning).toContain("1,000,000");
+	});
+
+	// No baseline to judge against - matching resolveReportedContextTokens' behavior for an
+	// unknown context window, the reading is trusted rather than guessed at.
+	it("trusts the reading when the session has no prior usage to compare against", () => {
+		const judged = createAssistantMessage("over", createMockUsage(1_782_723, 10));
+		const messages: AgentMessage[] = [createUserMessage("Hello"), judged];
+
+		const resolved = resolveOverflowPlausibility(1_782_723, messages, judged, 1_000_000);
+
+		expect(resolved).toEqual({ plausible: true });
 	});
 
 	it("returns the figure untouched when the context window is unknown", () => {
-		const messages: AgentMessage[] = [createUserMessage("Hello")];
+		const judged = createAssistantMessage("over", createMockUsage(1_050_000, 10));
+		const messages: AgentMessage[] = [
+			createUserMessage("Hello"),
+			createAssistantMessage("ok", createMockUsage(1_000, 50)),
+			judged,
+		];
 
-		const resolved = resolveOverflowPlausibility(1_050_000, messages, 0);
+		const resolved = resolveOverflowPlausibility(1_050_000, messages, judged, 0);
 
 		expect(resolved).toEqual({ plausible: true });
 	});
@@ -560,18 +607,28 @@ describe("resolveOverflowPlausibility", () => {
 		// Kept below MIN_REPORTED_TOKENS_FOR_RATIO_CHECK so the ratio dimension never applies,
 		// matching resolveReportedContextTokens's own floor rationale (fixed system-prompt/tool
 		// overhead outweighing a tiny conversation on an early, short session).
-		const messages: AgentMessage[] = [createUserMessage("Hello")];
+		const judged = createAssistantMessage("over", createMockUsage(40_000, 10));
+		const messages: AgentMessage[] = [
+			createUserMessage("Hello"),
+			createAssistantMessage("ok", createMockUsage(1_000, 50)), // previous reported usage: 1,050
+			judged,
+		];
 
-		const resolved = resolveOverflowPlausibility(40_000, messages, 30_000);
+		const resolved = resolveOverflowPlausibility(40_000, messages, judged, 30_000);
 
 		expect(resolved).toEqual({ plausible: true });
 	});
 
 	it("shares the one-shot per-window warning gate with resolveReportedContextTokens", () => {
-		const messages: AgentMessage[] = [createUserMessage("x".repeat(342_400))]; // measures to 85,600
+		const judged = createAssistantMessage("over", createMockUsage(1_782_723, 10));
+		const messages: AgentMessage[] = [
+			createUserMessage("hi"),
+			createAssistantMessage("ok", createMockUsage(85_000, 600)),
+			judged,
+		];
 
-		const first = resolveOverflowPlausibility(1_050_000, messages, 1_000_000);
-		const second = resolveReportedContextTokens(1_050_000, messages, 1_000_000);
+		const first = resolveOverflowPlausibility(1_782_723, messages, judged, 1_000_000);
+		const second = resolveReportedContextTokens(1_782_723, messages, 1_000_000);
 
 		expect(first.warning).toBeDefined();
 		expect(second.warning).toBeUndefined();

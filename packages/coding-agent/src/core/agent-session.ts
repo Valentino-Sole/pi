@@ -2178,20 +2178,24 @@ export class AgentSession {
 		// independent of the configured context size or any context-clamped provider request limit.
 		const rawContextOverflow = sameModel && isContextOverflow(assistantMessage, contextWindow);
 		// isContextOverflow's error-message case (stopReason "error") is the provider's own
-		// authoritative refusal of the request and is trusted outright. Its other two cases
-		// (z.ai-style silent overflow on a successful response, Xiaomi MiMo-style length-stop)
-		// both judge the same locally-reported usage.input + usage.cacheRead figure Case 3's
-		// guard below exists to distrust (see resolveOverflowPlausibility / the production
-		// incidents documented on isImplausibleContextTokens in compaction.ts) - a corrupted or
-		// inflated reading here would misfire "silent overflow" and force an unnecessary
-		// compact-and-retry through this path even though Case 3 would reject the very same
-		// number. Vet it the same way before trusting it.
+		// authoritative refusal of the request and is trusted outright. Its z.ai-style
+		// silent-overflow case (stopReason "stop") instead judges the same locally-reported
+		// usage.input + usage.cacheRead figure Case 3's guard below exists to distrust (see
+		// resolveOverflowPlausibility / the production incidents documented on
+		// isImplausibleContextTokens in compaction.ts) - a corrupted or inflated reading there
+		// would misfire "silent overflow" and force an unnecessary compact-and-retry through this
+		// path even though Case 3 would reject the very same number. Vet it the same way before
+		// trusting it. Its third case (Xiaomi MiMo-style length stop) is deliberately left
+		// untouched: `isRecoverableLength` below independently fires on exactly that message (a
+		// "length" stop with zero output is always under a positive maxTokens) and drives the same
+		// branch, so rejecting the overflow classification there would change no behavior.
 		let contextOverflow = rawContextOverflow;
-		if (rawContextOverflow && assistantMessage.stopReason !== "error") {
+		if (rawContextOverflow && assistantMessage.stopReason === "stop") {
 			const reportedOverflowTokens = assistantMessage.usage.input + assistantMessage.usage.cacheRead;
 			const overflowPlausibility = resolveOverflowPlausibility(
 				reportedOverflowTokens,
 				this.agent.state.messages,
+				assistantMessage,
 				contextWindow,
 			);
 			this._reportImplausibleContextWarning(overflowPlausibility.warning);

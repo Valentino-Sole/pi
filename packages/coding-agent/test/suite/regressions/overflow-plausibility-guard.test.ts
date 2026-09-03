@@ -5,15 +5,19 @@ import { createHarness, type Harness } from "../harness.ts";
 
 // isContextOverflow() (packages/ai/src/utils/overflow.ts) runs ahead of Case 3's plausibility
 // guard (see compaction-plausibility-guard.test.ts) and, for its z.ai-style "silent overflow"
-// and Xiaomi-MiMo-style "length-stop overflow" cases, judges the exact same locally-reported
-// usage.input + usage.cacheRead figure Case 3 was hardened against - a figure that has been
-// observed in production to wildly overstate a session's real content (819,151 reported vs
-// ~85,600 real measured content, ~9.6x). Left as a documented residual risk in the original
-// fix (fm/pi-compaction-plausibility-guard round2-review-findings, item
-// overflow-branch-precedes-guard) because packages/ai has no access to message history and
-// touching its shared overflow contract would affect every other provider. This closes that
-// gap at the one call site that has message history available (agent-session.ts's
-// `_checkCompaction`), leaving overflow.ts itself untouched.
+// case, judges the exact same locally-reported usage.input + usage.cacheRead figure Case 3 was
+// hardened against - a figure that has been observed in production to wildly overstate a
+// session's real content (819,151 reported vs ~85,600 real measured content, ~9.6x). Left as a
+// documented residual risk in the original fix (fm/pi-compaction-plausibility-guard
+// round2-review-findings, item overflow-branch-precedes-guard) because packages/ai has no access
+// to message history and touching its shared overflow contract would affect every other
+// provider. This closes that gap at the one call site that has message history available
+// (agent-session.ts's `_checkCompaction`), leaving overflow.ts itself untouched.
+//
+// isContextOverflow's third case (Xiaomi MiMo-style length stop) is intentionally not gated:
+// isRecoverableLength() independently fires on exactly those messages (stopReason "length" with
+// zero output is always below a positive maxTokens) and drives the same compact-and-retry
+// branch, so rejecting the overflow classification there would change no observable behavior.
 
 type SessionWithCompactionInternals = {
 	_checkCompaction: (assistantMessage: AssistantMessage, skipAbortedCheck?: boolean) => Promise<boolean>;
@@ -52,11 +56,20 @@ function overflowAssistantMessage(
 	};
 }
 
-async function createGuardHarness(maxTokens = 200): Promise<Harness> {
+async function createGuardHarness(): Promise<Harness> {
 	return createHarness({
-		models: [{ id: "faux-1", contextWindow: CONTEXT_WINDOW, maxTokens }],
+		models: [{ id: "faux-1", contextWindow: CONTEXT_WINDOW, maxTokens: 200 }],
 		settings: { compaction: { enabled: true, reserveTokens: 10 } },
 	});
+}
+
+// The baseline the guard judges against: the session's own last valid reported usage before the
+// message under judgement. Deliberately not a message-size sum - see resolveOverflowPlausibility.
+function priorTurn(harness: Harness, reportedTokens: number): AssistantMessage {
+	return {
+		...overflowAssistantMessage(harness, usageOf(reportedTokens), "stop"),
+		timestamp: Date.now() - 2,
+	};
 }
 
 describe("isContextOverflow's silent-overflow signal rejects an implausible reported usage figure", () => {
@@ -79,7 +92,8 @@ describe("isContextOverflow's silent-overflow signal rejects an implausible repo
 		harnesses.push(harness);
 		const bogus = overflowAssistantMessage(harness, usageOf(1_782_723), "stop");
 		harness.session.agent.state.messages = [
-			{ role: "user", content: [{ type: "text", text: "x".repeat(342_400) }], timestamp: Date.now() - 1 }, // measures to 85,600
+			{ role: "user", content: [{ type: "text", text: "hello" }], timestamp: Date.now() - 3 },
+			priorTurn(harness, 85_600),
 			bogus,
 		];
 		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
@@ -96,7 +110,8 @@ describe("isContextOverflow's silent-overflow signal rejects an implausible repo
 		harnesses.push(harness);
 		const bogus = overflowAssistantMessage(harness, usageOf(1_782_723), "stop");
 		harness.session.agent.state.messages = [
-			{ role: "user", content: [{ type: "text", text: "x".repeat(342_400) }], timestamp: Date.now() - 1 },
+			{ role: "user", content: [{ type: "text", text: "hello" }], timestamp: Date.now() - 3 },
+			priorTurn(harness, 85_600),
 			bogus,
 		];
 		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
@@ -109,14 +124,17 @@ describe("isContextOverflow's silent-overflow signal rejects an implausible repo
 		expect(String(anomalyWarnings[0][0])).toContain("1,782,723");
 	});
 
-	// A genuine silent overflow - the reported figure matches what the session's real content
-	// actually looks like - must still compact-without-retry exactly as before.
-	it("still auto-compacts via the overflow path from a silent-overflow reading that matches the real measured content (no regression)", async () => {
+	// A genuine silent overflow on a tool-heavy session: the conversation's own messages measure
+	// only ~85,600 tokens because the system prompt and tool definitions - which no message-size
+	// sum can see - carry the rest, and the session has been legitimately reporting ~980,500
+	// tokens all along. This must still compact-without-retry exactly as before.
+	it("still auto-compacts via the overflow path when the reading tracks the session's own previous reported usage (no regression)", async () => {
 		const harness = await createGuardHarness();
 		harnesses.push(harness);
 		const genuine = overflowAssistantMessage(harness, usageOf(1_050_000), "stop");
 		harness.session.agent.state.messages = [
-			{ role: "user", content: [{ type: "text", text: "x".repeat(4_200_000) }], timestamp: Date.now() - 1 }, // measures to ~1,050,000
+			{ role: "user", content: [{ type: "text", text: "x".repeat(342_400) }], timestamp: Date.now() - 3 }, // measures to 85,600
+			priorTurn(harness, 980_500),
 			genuine,
 		];
 		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
@@ -135,7 +153,8 @@ describe("isContextOverflow's silent-overflow signal rejects an implausible repo
 		harnesses.push(harness);
 		const errored = overflowAssistantMessage(harness, usageOf(1_782_723), "error");
 		harness.session.agent.state.messages = [
-			{ role: "user", content: [{ type: "text", text: "x".repeat(342_400) }], timestamp: Date.now() - 1 },
+			{ role: "user", content: [{ type: "text", text: "hello" }], timestamp: Date.now() - 3 },
+			priorTurn(harness, 85_600),
 			errored,
 		];
 		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
@@ -144,25 +163,5 @@ describe("isContextOverflow's silent-overflow signal rejects an implausible repo
 		await sessionInternals._checkCompaction(errored);
 
 		expect(runAutoCompactionSpy).toHaveBeenCalledWith("overflow", true);
-	});
-
-	// isContextOverflow's Xiaomi-MiMo-style length-stop case: the provider truncates input to
-	// fill contextWindow exactly, leaving no room for output. maxTokens: 0 isolates this from
-	// isRecoverableLength (a separate, independent trigger for the same overall branch that
-	// would otherwise also fire on this stopReason regardless of the overflow classification).
-	it("does not auto-compact via the overflow path from a length-stop reading that wildly overstates the real measured content", async () => {
-		const harness = await createGuardHarness(0);
-		harnesses.push(harness);
-		const bogus = overflowAssistantMessage(harness, usageOf(999_000, 0, 0), "length");
-		harness.session.agent.state.messages = [
-			{ role: "user", content: [{ type: "text", text: "x".repeat(342_400) }], timestamp: Date.now() - 1 }, // measures to 85,600
-			bogus,
-		];
-		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
-		const runAutoCompactionSpy = vi.spyOn(sessionInternals, "_runAutoCompaction").mockResolvedValue(false);
-
-		await sessionInternals._checkCompaction(bogus);
-
-		expect(runAutoCompactionSpy).not.toHaveBeenCalledWith("overflow", expect.anything());
 	});
 });

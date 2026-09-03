@@ -196,9 +196,21 @@ const MIN_REPORTED_TOKENS_FOR_RATIO_CHECK = 50_000;
 function isImplausibleContextTokens(reportedTokens: number, measuredTokens: number, contextWindow: number): boolean {
 	if (contextWindow <= 0) return false;
 	if (reportedTokens > contextWindow) return true;
+	return exceedsPlausibleRatio(reportedTokens, measuredTokens);
+}
+
+/**
+ * The reported-vs-baseline ratio dimension of the plausibility question, shared by both callers
+ * so the threshold semantics live in exactly one place. `baselineTokens` is whatever independent
+ * figure the caller can hold the reported one up against: a message-size sum for
+ * {@link resolveReportedContextTokens}, the session's own previous reported usage for
+ * {@link resolveOverflowPlausibility}. Both constants above document why a ratio alone is not
+ * enough and why the absolute floor applies to the reported figure rather than the baseline.
+ */
+function exceedsPlausibleRatio(reportedTokens: number, baselineTokens: number): boolean {
 	return (
 		reportedTokens > MIN_REPORTED_TOKENS_FOR_RATIO_CHECK &&
-		reportedTokens > measuredTokens * REPORTED_VS_MEASURED_IMPLAUSIBILITY_RATIO
+		reportedTokens > baselineTokens * REPORTED_VS_MEASURED_IMPLAUSIBILITY_RATIO
 	);
 }
 
@@ -284,19 +296,60 @@ export function resolveReportedContextTokens(
 }
 
 /**
- * Vet a provider-reported *overflow* signal - `isContextOverflow`'s z.ai-style silent-overflow
- * case (a successful response whose usage.input + usage.cacheRead exceeds contextWindow) or its
- * Xiaomi MiMo-style length-stop case (the same figure filling contextWindow with zero output) -
- * against the session's real, measured content.
+ * Format the one-shot warning for a provider-reported *overflow* signal that was rejected.
+ * Kept separate from {@link formatImplausibleContextTokensWarning} because the two rejections
+ * have different consequences: that one substitutes a message-size estimate for the figure,
+ * while this one discards an overflow classification and leaves the turn alone. Printing is
+ * the caller's job for the same UI-ownership reason documented there.
+ */
+function formatImplausibleOverflowWarning(
+	reportedTokens: number,
+	priorReportedTokens: number,
+	contextWindow: number,
+): string {
+	return chalk.yellow(
+		`Warning: provider-reported context usage (${reportedTokens.toLocaleString()} tokens) is not plausible ` +
+			`for this session (previous reported usage: ${priorReportedTokens.toLocaleString()} tokens, model ` +
+			`context window: ${contextWindow.toLocaleString()} tokens) and was rejected as implausible; the ` +
+			`reported context overflow was ignored.`,
+	);
+}
+
+/**
+ * Find the session's own last valid reported context size *before* `judgedMessage`, so the
+ * message under judgement cannot serve as its own baseline. Uses the same last-valid-usage walk
+ * (and the same aborted/errored/all-zero skipping) `getLastAssistantUsageInfo` performs.
+ */
+function findPriorReportedContextTokens(messages: AgentMessage[], judgedMessage: AgentMessage): number | undefined {
+	const judgedIndex = messages.lastIndexOf(judgedMessage);
+	const start = judgedIndex >= 0 ? judgedIndex - 1 : messages.length - 1;
+	for (let i = start; i >= 0; i--) {
+		const usage = getAssistantUsage(messages[i]);
+		if (usage) return calculateContextTokens(usage);
+	}
+	return undefined;
+}
+
+/**
+ * Vet `isContextOverflow`'s z.ai-style silent-overflow signal - a successful response whose
+ * usage.input + usage.cacheRead exceeds contextWindow - against the session's own previous
+ * reported usage.
  *
  * Unlike {@link resolveReportedContextTokens}, the reported figure sitting at or above
- * `contextWindow` is not itself evidence of anomaly here: that is exactly the condition both
- * overflow cases are built to detect (a provider that accepts, or truncates to fit, a request
- * larger than its documented window - see overflow.ts). Only the same reported-vs-measured ratio
- * comparison `isImplausibleContextTokens` uses applies, so a corrupted or inflated usage.input
- * reading (the same failure mode Case 3's guard above defends against) cannot misfire an
- * unnecessary compact-and-retry through the overflow path just because it happens to clear
- * contextWindow too.
+ * `contextWindow` is not itself evidence of anomaly here: that is exactly the condition this
+ * overflow case is built to detect (a provider that accepts a request larger than its documented
+ * window - see overflow.ts). Only the ratio dimension applies, and it deliberately does *not*
+ * use `sumMessageTokens`: that measures the `messages` array alone, excluding the system prompt
+ * and tool definitions, which is precisely the overhead that dominates in the overflow regime -
+ * a tool-heavy session can legitimately report several times its own measured message content
+ * without anything being corrupted. The session's previous reported usage carries that same
+ * roughly-constant overhead, so the comparison stays apples-to-apples and only a reading that
+ * jumps far beyond what this very session reported one turn ago (the failure mode Case 3's guard
+ * defends against) is rejected.
+ *
+ * With no prior valid usage to compare against - a session's first turn - the reading is trusted,
+ * matching the no-baseline-available behavior of {@link resolveReportedContextTokens} for an
+ * unknown context window.
  *
  * @returns `plausible: false` when the reported figure should be rejected as an overflow signal
  * (the caller should not treat this as a real overflow). `warning` carries the one-shot anomaly
@@ -306,20 +359,21 @@ export function resolveReportedContextTokens(
 export function resolveOverflowPlausibility(
 	reportedTokens: number,
 	messages: AgentMessage[],
+	judgedMessage: AgentMessage,
 	contextWindow: number,
 ): { plausible: boolean; warning?: string } {
 	if (contextWindow <= 0) {
 		return { plausible: true };
 	}
-	const measuredTokens = sumMessageTokens(messages);
-	const implausible =
-		reportedTokens > MIN_REPORTED_TOKENS_FOR_RATIO_CHECK &&
-		reportedTokens > measuredTokens * REPORTED_VS_MEASURED_IMPLAUSIBILITY_RATIO;
-	if (!implausible) {
+	const priorReportedTokens = findPriorReportedContextTokens(messages, judgedMessage);
+	if (priorReportedTokens === undefined) {
+		return { plausible: true };
+	}
+	if (!exceedsPlausibleRatio(reportedTokens, priorReportedTokens)) {
 		return { plausible: true };
 	}
 	const warning = shouldAnnounceImplausibleContextTokens(contextWindow)
-		? formatImplausibleContextTokensWarning(reportedTokens, measuredTokens, contextWindow)
+		? formatImplausibleOverflowWarning(reportedTokens, priorReportedTokens, contextWindow)
 		: undefined;
 	return { plausible: false, warning };
 }
