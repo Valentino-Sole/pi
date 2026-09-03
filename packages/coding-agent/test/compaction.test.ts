@@ -610,6 +610,51 @@ describe("resolveOverflowPlausibility", () => {
 		expect(resolved).toEqual({ plausible: true });
 	});
 
+	// "No usable prior reading" is not the same as "first turn". A session that hit persistent
+	// API errors (e.g. 529) has no prior usage the walk will accept, yet `messages` holds a real
+	// conversation whose measured content is a perfectly good baseline - here 85,600 tokens of
+	// pasted text against the production incident's 1,782,723 reading. Trusting the reading just
+	// because the errored turn was skipped would force-compact that session for nothing.
+	it("still judges the reading when earlier turns exist but none carries usable usage", () => {
+		const errored: AgentMessage = {
+			...createAssistantMessage("failed", createMockUsage(0, 0)),
+			stopReason: "error",
+		};
+		const judged = createAssistantMessage("over", createMockUsage(1_782_723, 10));
+		const messages: AgentMessage[] = [
+			createUserMessage("x".repeat(342_400)), // measures to 85,600
+			errored,
+			createUserMessage("try again"),
+			judged,
+		];
+
+		const resolved = resolveOverflowPlausibility(1_782_723, messages, judged, 1_000_000);
+
+		expect(resolved.plausible).toBe(false);
+		expect(resolved.warning).toContain("1,782,723");
+	});
+
+	// A predecessor above the model's own context window is a reading this guard already refused:
+	// had it been believed, its own turn would have compacted and the compaction boundary would
+	// exclude it here. Vetting the predecessor on the ratio alone let such a figure return one
+	// turn later as the authority that waves its successor through - 1,300,000 sits within 5x of
+	// the 300,000 measured content, so it would have validated a 1,600,000 reading and
+	// force-compacted a session holding ~300,000 real tokens.
+	it("rejects a reading whose predecessor baseline itself exceeded the context window", () => {
+		const judged = createAssistantMessage("over", createMockUsage(1_600_000, 10));
+		const messages: AgentMessage[] = [
+			createUserMessage("x".repeat(1_200_000)), // measures to 300,000
+			createAssistantMessage("ok", createMockUsage(1_300_000, 0)), // above the 1,000,000 window
+			judged,
+		];
+
+		const resolved = resolveOverflowPlausibility(1_600_000, messages, judged, 1_000_000);
+
+		expect(resolved.plausible).toBe(false);
+		expect(resolved.warning).toContain("1,600,000");
+		expect(resolved.warning).toContain("300,0");
+	});
+
 	it("returns the figure untouched when the context window is unknown", () => {
 		const judged = createAssistantMessage("over", createMockUsage(1_050_000, 10));
 		const messages: AgentMessage[] = [
