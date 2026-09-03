@@ -525,20 +525,20 @@ describe("resolveOverflowPlausibility", () => {
 	});
 
 	// The reported figure is held up against the session's own previous reported usage rather
-	// than a message-size sum. In the overflow regime the system prompt and tool definitions -
+	// than a bare message-size sum. In the overflow regime the system prompt and tool definitions -
 	// which sumMessageTokens cannot see at all - are exactly what makes a reported figure exceed
 	// the measured conversation, so a message-size baseline would reject genuine overflows on
-	// tool-heavy sessions. Here the conversation measures ~25,000 tokens while the session is
-	// legitimately reporting ~120,000.
+	// tool-heavy sessions. Here the conversation measures ~25,000 tokens (8x below the reported
+	// figure) while the session has been legitimately reporting 120,000 all along.
 	it("trusts a genuine overflow on a tool-heavy session whose messages measure far below the reported figure", () => {
-		const judged = createAssistantMessage("over", createMockUsage(130_000, 10));
+		const judged = createAssistantMessage("over", createMockUsage(200_000, 10));
 		const messages: AgentMessage[] = [
 			createUserMessage("x".repeat(100_000)), // measures to 25,000
-			createAssistantMessage("ok", createMockUsage(120_000, 200)), // previous reported usage: 120,200
+			createAssistantMessage("ok", createMockUsage(120_000, 0)), // previous reported usage: 120,000
 			judged,
 		];
 
-		const resolved = resolveOverflowPlausibility(130_000, messages, judged, 128_000);
+		const resolved = resolveOverflowPlausibility(200_000, messages, judged, 128_000);
 
 		expect(resolved).toEqual({ plausible: true });
 	});
@@ -549,8 +549,8 @@ describe("resolveOverflowPlausibility", () => {
 	it("trusts an overflow reading that stays within a plausible multiple of the previous reported usage", () => {
 		const judged = createAssistantMessage("over", createMockUsage(1_050_000, 10));
 		const messages: AgentMessage[] = [
-			createUserMessage("hi"),
-			createAssistantMessage("ok", createMockUsage(980_000, 500)), // previous reported usage: 980,500
+			createUserMessage("x".repeat(800_000)), // measures to 200,000
+			createAssistantMessage("ok", createMockUsage(980_500, 0)), // previous reported usage: 980,500
 			judged,
 		];
 
@@ -566,8 +566,8 @@ describe("resolveOverflowPlausibility", () => {
 	it("rejects an overflow reading that jumps far beyond the session's previous reported usage", () => {
 		const judged = createAssistantMessage("over", createMockUsage(1_782_723, 10));
 		const messages: AgentMessage[] = [
-			createUserMessage("hi"),
-			createAssistantMessage("ok", createMockUsage(85_000, 600)), // previous reported usage: 85,600
+			createUserMessage("x".repeat(342_400)), // measures to 85,600
+			createAssistantMessage("ok", createMockUsage(120_000, 0)), // previous reported usage: 120,000
 			judged,
 		];
 
@@ -575,8 +575,28 @@ describe("resolveOverflowPlausibility", () => {
 
 		expect(resolved.plausible).toBe(false);
 		expect(resolved.warning).toContain("1,782,723");
-		expect(resolved.warning).toContain("85,600");
+		expect(resolved.warning).toContain("120,000");
 		expect(resolved.warning).toContain("1,000,000");
+	});
+
+	// A provider stuck in an anomalous reporting mode overstates on every turn, so the previous
+	// turn's figure is only a usable baseline while it is itself credible against the session's
+	// measured content. Without vetting it, the second anomalous reading validates itself against
+	// the first (1,790,000 is well within 5x of 1,782,723) and the guard stops working from the
+	// second turn onward.
+	it("rejects a reading whose only support is an equally implausible predecessor", () => {
+		const judged = createAssistantMessage("over", createMockUsage(1_790_000, 10));
+		const messages: AgentMessage[] = [
+			createUserMessage("x".repeat(342_400)), // measures to 85,600
+			createAssistantMessage("ok", createMockUsage(1_782_723, 0)), // previously rejected reading
+			judged,
+		];
+
+		const resolved = resolveOverflowPlausibility(1_790_000, messages, judged, 1_000_000);
+
+		expect(resolved.plausible).toBe(false);
+		expect(resolved.warning).toContain("1,790,000");
+		expect(resolved.warning).toContain("85,602");
 	});
 
 	// No baseline to judge against - matching resolveReportedContextTokens' behavior for an
@@ -622,8 +642,8 @@ describe("resolveOverflowPlausibility", () => {
 	it("shares the one-shot per-window warning gate with resolveReportedContextTokens", () => {
 		const judged = createAssistantMessage("over", createMockUsage(1_782_723, 10));
 		const messages: AgentMessage[] = [
-			createUserMessage("hi"),
-			createAssistantMessage("ok", createMockUsage(85_000, 600)),
+			createUserMessage("x".repeat(342_400)),
+			createAssistantMessage("ok", createMockUsage(120_000, 0)),
 			judged,
 		];
 

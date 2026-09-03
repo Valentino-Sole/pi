@@ -92,8 +92,8 @@ describe("isContextOverflow's silent-overflow signal rejects an implausible repo
 		harnesses.push(harness);
 		const bogus = overflowAssistantMessage(harness, usageOf(1_782_723), "stop");
 		harness.session.agent.state.messages = [
-			{ role: "user", content: [{ type: "text", text: "hello" }], timestamp: Date.now() - 3 },
-			priorTurn(harness, 85_600),
+			{ role: "user", content: [{ type: "text", text: "x".repeat(342_400) }], timestamp: Date.now() - 3 }, // measures to 85,600
+			priorTurn(harness, 120_000),
 			bogus,
 		];
 		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
@@ -110,8 +110,8 @@ describe("isContextOverflow's silent-overflow signal rejects an implausible repo
 		harnesses.push(harness);
 		const bogus = overflowAssistantMessage(harness, usageOf(1_782_723), "stop");
 		harness.session.agent.state.messages = [
-			{ role: "user", content: [{ type: "text", text: "hello" }], timestamp: Date.now() - 3 },
-			priorTurn(harness, 85_600),
+			{ role: "user", content: [{ type: "text", text: "x".repeat(342_400) }], timestamp: Date.now() - 3 }, // measures to 85,600
+			priorTurn(harness, 120_000),
 			bogus,
 		];
 		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
@@ -125,7 +125,7 @@ describe("isContextOverflow's silent-overflow signal rejects an implausible repo
 	});
 
 	// A genuine silent overflow on a tool-heavy session: the conversation's own messages measure
-	// only ~85,600 tokens because the system prompt and tool definitions - which no message-size
+	// only ~200,000 tokens because the system prompt and tool definitions - which no message-size
 	// sum can see - carry the rest, and the session has been legitimately reporting ~980,500
 	// tokens all along. This must still compact-without-retry exactly as before.
 	it("still auto-compacts via the overflow path when the reading tracks the session's own previous reported usage (no regression)", async () => {
@@ -133,7 +133,7 @@ describe("isContextOverflow's silent-overflow signal rejects an implausible repo
 		harnesses.push(harness);
 		const genuine = overflowAssistantMessage(harness, usageOf(1_050_000), "stop");
 		harness.session.agent.state.messages = [
-			{ role: "user", content: [{ type: "text", text: "x".repeat(342_400) }], timestamp: Date.now() - 3 }, // measures to 85,600
+			{ role: "user", content: [{ type: "text", text: "x".repeat(800_000) }], timestamp: Date.now() - 3 }, // measures to 200,000
 			priorTurn(harness, 980_500),
 			genuine,
 		];
@@ -143,6 +143,27 @@ describe("isContextOverflow's silent-overflow signal rejects an implausible repo
 		await sessionInternals._checkCompaction(genuine);
 
 		expect(runAutoCompactionSpy).toHaveBeenCalledWith("overflow", false);
+	});
+
+	// The same provider keeps overstating on every turn, so turn 1's already-rejected reading is
+	// still sitting in agent state when turn 2 is judged. Trusting it as the baseline would let
+	// 1,790,000 validate itself against 1,782,723 and force a compaction of a session that really
+	// holds ~85,600 tokens - the exact outcome this guard exists to prevent.
+	it("does not auto-compact from a second anomalous reading whose only support is the first one", async () => {
+		const harness = await createGuardHarness();
+		harnesses.push(harness);
+		const second = overflowAssistantMessage(harness, usageOf(1_790_000), "stop");
+		harness.session.agent.state.messages = [
+			{ role: "user", content: [{ type: "text", text: "x".repeat(342_400) }], timestamp: Date.now() - 3 }, // measures to 85,600
+			priorTurn(harness, 1_782_723),
+			second,
+		];
+		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
+		const runAutoCompactionSpy = vi.spyOn(sessionInternals, "_runAutoCompaction").mockResolvedValue(false);
+
+		await sessionInternals._checkCompaction(second);
+
+		expect(runAutoCompactionSpy).not.toHaveBeenCalledWith("overflow", expect.anything());
 	});
 
 	// Case 1 (a provider explicitly erroring "prompt is too long") is the provider's own

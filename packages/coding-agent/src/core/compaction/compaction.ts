@@ -304,14 +304,14 @@ export function resolveReportedContextTokens(
  */
 function formatImplausibleOverflowWarning(
 	reportedTokens: number,
-	priorReportedTokens: number,
+	baselineTokens: number,
 	contextWindow: number,
 ): string {
 	return chalk.yellow(
 		`Warning: provider-reported context usage (${reportedTokens.toLocaleString()} tokens) is not plausible ` +
-			`for this session (previous reported usage: ${priorReportedTokens.toLocaleString()} tokens, model ` +
-			`context window: ${contextWindow.toLocaleString()} tokens) and was rejected as implausible; the ` +
-			`reported context overflow was ignored.`,
+			`for this session (session baseline: ${baselineTokens.toLocaleString()} tokens, model context ` +
+			`window: ${contextWindow.toLocaleString()} tokens) and was rejected as implausible; the reported ` +
+			`context overflow was ignored.`,
 	);
 }
 
@@ -338,14 +338,24 @@ function findPriorReportedContextTokens(messages: AgentMessage[], judgedMessage:
  * Unlike {@link resolveReportedContextTokens}, the reported figure sitting at or above
  * `contextWindow` is not itself evidence of anomaly here: that is exactly the condition this
  * overflow case is built to detect (a provider that accepts a request larger than its documented
- * window - see overflow.ts). Only the ratio dimension applies, and it deliberately does *not*
- * use `sumMessageTokens`: that measures the `messages` array alone, excluding the system prompt
- * and tool definitions, which is precisely the overhead that dominates in the overflow regime -
- * a tool-heavy session can legitimately report several times its own measured message content
- * without anything being corrupted. The session's previous reported usage carries that same
- * roughly-constant overhead, so the comparison stays apples-to-apples and only a reading that
- * jumps far beyond what this very session reported one turn ago (the failure mode Case 3's guard
- * defends against) is rejected.
+ * window - see overflow.ts). Only the ratio dimension applies, and it prefers the session's own
+ * previous reported usage over a bare `sumMessageTokens`: that sum measures the `messages` array
+ * alone, excluding the system prompt and tool definitions, which is precisely the overhead that
+ * dominates in the overflow regime - a tool-heavy session can legitimately report several times
+ * its own measured message content without anything being corrupted. A previous reported figure
+ * carries that same roughly-constant overhead, so the comparison stays apples-to-apples and only
+ * a reading that jumps far beyond what this very session reported one turn ago (the failure mode
+ * Case 3's guard defends against) is rejected.
+ *
+ * That previous figure is only usable as a baseline while it is itself credible. A provider stuck
+ * in an anomalous reporting mode keeps overstating on every turn, so an unvetted predecessor
+ * would let the second such reading validate itself against the first and defeat the guard from
+ * then on. The predecessor therefore faces the same ratio test against `sumMessageTokens` before
+ * it is trusted - the current message-size sum is an upper bound on the smaller content that
+ * existed at that earlier turn, so no historical snapshot is needed - and a predecessor that
+ * fails it is discarded in favour of the measured sum alone. A credible one is combined with the
+ * measured sum via `max`, so a genuinely large, self-consistent history still gets the higher and
+ * more accurate baseline.
  *
  * With no prior valid usage to compare against - a session's first turn - the reading is trusted,
  * matching the no-baseline-available behavior of {@link resolveReportedContextTokens} for an
@@ -369,11 +379,15 @@ export function resolveOverflowPlausibility(
 	if (priorReportedTokens === undefined) {
 		return { plausible: true };
 	}
-	if (!exceedsPlausibleRatio(reportedTokens, priorReportedTokens)) {
+	const measuredTokens = sumMessageTokens(messages);
+	const baselineTokens = exceedsPlausibleRatio(priorReportedTokens, measuredTokens)
+		? measuredTokens
+		: Math.max(priorReportedTokens, measuredTokens);
+	if (!exceedsPlausibleRatio(reportedTokens, baselineTokens)) {
 		return { plausible: true };
 	}
 	const warning = shouldAnnounceImplausibleContextTokens(contextWindow)
-		? formatImplausibleOverflowWarning(reportedTokens, priorReportedTokens, contextWindow)
+		? formatImplausibleOverflowWarning(reportedTokens, baselineTokens, contextWindow)
 		: undefined;
 	return { plausible: false, warning };
 }
