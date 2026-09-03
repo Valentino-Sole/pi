@@ -196,9 +196,21 @@ const MIN_REPORTED_TOKENS_FOR_RATIO_CHECK = 50_000;
 function isImplausibleContextTokens(reportedTokens: number, measuredTokens: number, contextWindow: number): boolean {
 	if (contextWindow <= 0) return false;
 	if (reportedTokens > contextWindow) return true;
+	return exceedsPlausibleRatio(reportedTokens, measuredTokens);
+}
+
+/**
+ * The reported-vs-baseline ratio dimension of the plausibility question, shared by both callers
+ * so the threshold semantics live in exactly one place. `baselineTokens` is whatever independent
+ * figure the caller can hold the reported one up against: a message-size sum for
+ * {@link resolveReportedContextTokens}, the session's own previous reported usage for
+ * {@link resolveOverflowPlausibility}. Both constants above document why a ratio alone is not
+ * enough and why the absolute floor applies to the reported figure rather than the baseline.
+ */
+function exceedsPlausibleRatio(reportedTokens: number, baselineTokens: number): boolean {
 	return (
 		reportedTokens > MIN_REPORTED_TOKENS_FOR_RATIO_CHECK &&
-		reportedTokens > measuredTokens * REPORTED_VS_MEASURED_IMPLAUSIBILITY_RATIO
+		reportedTokens > baselineTokens * REPORTED_VS_MEASURED_IMPLAUSIBILITY_RATIO
 	);
 }
 
@@ -281,6 +293,151 @@ export function resolveReportedContextTokens(
 		? formatImplausibleContextTokensWarning(reportedTokens, measuredTokens, contextWindow)
 		: undefined;
 	return { tokens: measuredTokens, rejected: true, warning };
+}
+
+/**
+ * Format the one-shot warning for a provider-reported *overflow* signal that was rejected.
+ * Kept separate from {@link formatImplausibleContextTokensWarning} because the two rejections
+ * have different consequences: that one substitutes a message-size estimate for the figure,
+ * while this one discards an overflow classification and leaves the turn alone. Printing is
+ * the caller's job for the same UI-ownership reason documented there.
+ */
+function formatImplausibleOverflowWarning(
+	reportedTokens: number,
+	baselineTokens: number,
+	contextWindow: number,
+): string {
+	return chalk.yellow(
+		`Warning: provider-reported context usage (${reportedTokens.toLocaleString()} tokens) is not plausible ` +
+			`for this session (session baseline: ${baselineTokens.toLocaleString()} tokens, model context ` +
+			`window: ${contextWindow.toLocaleString()} tokens) and was rejected as implausible; the reported ` +
+			`context overflow was ignored.`,
+	);
+}
+
+/**
+ * Find the session's own last valid reported context size *before* `judgedMessage`, so the
+ * message under judgement cannot serve as its own baseline. Uses the same last-valid-usage walk
+ * (and the same aborted/errored/all-zero skipping) `getLastAssistantUsageInfo` performs.
+ *
+ * `compactionBoundaryTimestamp` (epoch ms of the latest compaction entry, when the session has
+ * one) excludes candidates from before that boundary, mirroring the identical stale-usage check
+ * the threshold-compaction path already performs. A compaction keeps its most recent messages
+ * verbatim - usage field included - while dropping everything it summarized, so a kept assistant
+ * still reports the old, far larger context. Left in play it would hand this guard an inflated
+ * baseline that waves through exactly the corrupted readings the guard exists to reject.
+ *
+ * `hadPriorAssistantTurn` reports whether the walk saw *any* earlier assistant message, usable
+ * or not. Its callers must not read a missing `tokens` as "this is the session's first turn":
+ * the walk skips aborted, errored and all-zero-usage messages, so a long session that hit
+ * persistent API errors yields no figure while `messages` has nonetheless accumulated a full
+ * conversation worth measuring.
+ */
+function findPriorReportedContextTokens(
+	messages: AgentMessage[],
+	judgedMessage: AgentMessage,
+	compactionBoundaryTimestamp?: number,
+): { tokens?: number; hadPriorAssistantTurn: boolean } {
+	const judgedIndex = messages.lastIndexOf(judgedMessage);
+	const start = judgedIndex >= 0 ? judgedIndex - 1 : messages.length - 1;
+	let hadPriorAssistantTurn = false;
+	for (let i = start; i >= 0; i--) {
+		const message = messages[i];
+		if (message.role !== "assistant") continue;
+		hadPriorAssistantTurn = true;
+		const usage = getAssistantUsage(message);
+		if (!usage) continue;
+		if (
+			compactionBoundaryTimestamp !== undefined &&
+			(message as AssistantMessage).timestamp <= compactionBoundaryTimestamp
+		) {
+			return { hadPriorAssistantTurn };
+		}
+		return { tokens: calculateContextTokens(usage), hadPriorAssistantTurn };
+	}
+	return { hadPriorAssistantTurn };
+}
+
+/**
+ * Vet `isContextOverflow`'s z.ai-style silent-overflow signal - a successful response whose
+ * usage.input + usage.cacheRead exceeds contextWindow - against the session's own previous
+ * reported usage.
+ *
+ * Unlike {@link resolveReportedContextTokens}, the reported figure sitting at or above
+ * `contextWindow` is not itself evidence of anomaly here: that is exactly the condition this
+ * overflow case is built to detect (a provider that accepts a request larger than its documented
+ * window - see overflow.ts). Only the ratio dimension applies, and it prefers the session's own
+ * previous reported usage over a bare `sumMessageTokens`: that sum measures the `messages` array
+ * alone, excluding the system prompt and tool definitions, which is precisely the overhead that
+ * dominates in the overflow regime - a tool-heavy session can legitimately report several times
+ * its own measured message content without anything being corrupted. A previous reported figure
+ * carries that same roughly-constant overhead, so the comparison stays apples-to-apples and only
+ * a reading that jumps far beyond what this very session reported one turn ago (the failure mode
+ * Case 3's guard defends against) is rejected.
+ *
+ * That previous figure is only usable as a baseline while it is itself credible. A provider stuck
+ * in an anomalous reporting mode keeps overstating on every turn, so an unvetted predecessor
+ * would let the second such reading validate itself against the first and defeat the guard from
+ * then on. The predecessor therefore faces the full {@link isImplausibleContextTokens} test -
+ * both the ratio against `sumMessageTokens` and the context window - before it is trusted. The
+ * window dimension is waived for the judged reading only because an above-window figure is the
+ * very signal under judgement; a *predecessor* enjoys no such exemption, because a predecessor
+ * whose own above-window reading had been believed would already have forced a compaction on its
+ * own turn and be excluded here by `compactionBoundaryTimestamp`. One that survives to this walk
+ * is therefore a reading this guard already refused, and it must not come back a turn later as
+ * the authority that waves its successor through. For the ratio dimension, since
+ * `compactionBoundaryTimestamp` confines candidates to the current post-compaction segment,
+ * which only ever grows, the current message-size sum is an upper bound on the smaller content
+ * that existed at that earlier turn and no historical snapshot is needed. A predecessor that
+ * fails either dimension is discarded in favour of the measured sum alone. A credible one is
+ * combined with the measured sum via `max`, so a genuinely large, self-consistent history still
+ * gets the higher and more accurate baseline.
+ *
+ * The ways that leaves no prior reading are not equivalent. On a session's very first turn
+ * `messages` holds little more than the user's prompt, so it measures almost nothing about the
+ * request the provider actually sized and cannot serve as a baseline at all - the reading is
+ * trusted, matching the no-baseline-available behavior of {@link resolveReportedContextTokens}
+ * for an unknown context window. That concession is confined to a genuinely first turn, i.e. one
+ * with no earlier assistant message whatsoever: once the session has taken turns whose usage was
+ * merely unusable (aborted, errored, all-zero), `messages` holds a real conversation and its
+ * measured sum is a baseline, so the guard still applies. On the first turn after a compaction
+ * the array likewise holds a complete picture of the current context content (the summary plus
+ * the kept tail), so the measured sum stands alone as the baseline, the same fallback an
+ * untrustworthy predecessor gets.
+ *
+ * @returns `plausible: false` when the reported figure should be rejected as an overflow signal
+ * (the caller should not treat this as a real overflow). `warning` carries the one-shot anomaly
+ * message (see `shouldAnnounceImplausibleContextTokens`) for the caller to print through its own
+ * UI-aware channel when the reading is rejected.
+ */
+export function resolveOverflowPlausibility(
+	reportedTokens: number,
+	messages: AgentMessage[],
+	judgedMessage: AgentMessage,
+	contextWindow: number,
+	compactionBoundaryTimestamp?: number,
+): { plausible: boolean; warning?: string } {
+	if (contextWindow <= 0) {
+		return { plausible: true };
+	}
+	const prior = findPriorReportedContextTokens(messages, judgedMessage, compactionBoundaryTimestamp);
+	if (!prior.hadPriorAssistantTurn && compactionBoundaryTimestamp === undefined) {
+		return { plausible: true };
+	}
+	const measuredTokens = sumMessageTokens(messages);
+	const priorReportedTokens = prior.tokens;
+	const baselineTokens =
+		priorReportedTokens === undefined ||
+		isImplausibleContextTokens(priorReportedTokens, measuredTokens, contextWindow)
+			? measuredTokens
+			: Math.max(priorReportedTokens, measuredTokens);
+	if (!exceedsPlausibleRatio(reportedTokens, baselineTokens)) {
+		return { plausible: true };
+	}
+	const warning = shouldAnnounceImplausibleContextTokens(contextWindow)
+		? formatImplausibleOverflowWarning(reportedTokens, baselineTokens, contextWindow)
+		: undefined;
+	return { plausible: false, warning };
 }
 
 /**

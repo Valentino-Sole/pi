@@ -17,6 +17,7 @@ packages/ai/src/providers/.model-generation-*/
 
 # Editor files
 .vscode/
+.squish/
 .zed/
 .idea/
 .claude/
